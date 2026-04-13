@@ -1756,6 +1756,9 @@ class GatewayRunner:
         await asyncio.sleep(60)  # initial delay — let the gateway fully start
         _flush_failures: dict[str, int] = {}  # session_id -> consecutive failure count
         _MAX_FLUSH_RETRIES = 3
+        # Daily artifact cleanup: 288 cycles × 5-min interval ≈ 24h
+        _ARTIFACT_CLEANUP_EVERY = max(1, (24 * 3600) // interval)
+        _artifact_tick = 0
         while self._running:
             try:
                 self.session_store._ensure_loaded()
@@ -1856,6 +1859,30 @@ class GatewayRunner:
                         )
             except Exception as e:
                 logger.debug("Session expiry watcher error: %s", e)
+
+            # --- Daily disk artifact cleanup ---
+            # Run once per day (every 288 cycles at 5-min interval = 24h).
+            # Cleans up stale session transcript files and checkpoint directories.
+            _artifact_tick += 1
+            if _artifact_tick >= _ARTIFACT_CLEANUP_EVERY:
+                _artifact_tick = 0
+                try:
+                    from tools.session_cleanup import prune_all_artifacts
+                    _hermes_home = get_hermes_home()
+                    _results = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: prune_all_artifacts(_hermes_home, self._session_db),
+                    )
+                    _total_freed = sum(v[1] for v in _results.values())
+                    _total_count = sum(v[0] for v in _results.values())
+                    if _total_count:
+                        logger.info(
+                            "Artifact cleanup: removed %d items, freed %d KB",
+                            _total_count, _total_freed // 1024,
+                        )
+                except Exception as e:
+                    logger.debug("Artifact cleanup error: %s", e)
+
             # Sleep in small increments so we can stop quickly
             for _ in range(interval):
                 if not self._running:

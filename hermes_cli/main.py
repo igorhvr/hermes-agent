@@ -5397,6 +5397,12 @@ For more help on a command:
     sessions_prune.add_argument("--older-than", type=int, default=90, help="Delete sessions older than N days (default: 90)")
     sessions_prune.add_argument("--source", help="Only prune sessions from this source")
     sessions_prune.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    sessions_prune.add_argument("--include-files", action="store_true",
+                                help="Also delete session transcript files and stale checkpoints from disk")
+    sessions_prune.add_argument("--files-only", action="store_true",
+                                help="Only clean disk files (session transcripts, request dumps, checkpoints) — skip DB pruning")
+    sessions_prune.add_argument("--dry-run", action="store_true",
+                                help="Show what would be deleted without actually deleting")
 
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
@@ -5503,12 +5509,50 @@ For more help on a command:
         elif action == "prune":
             days = args.older_than
             source_msg = f" from '{args.source}'" if args.source else ""
-            if not args.yes:
-                if not _confirm_prompt(f"Delete all ended sessions older than {days} days{source_msg}? [y/N] "):
+            files_only = getattr(args, "files_only", False)
+            include_files = getattr(args, "include_files", False) or files_only
+            dry_run = getattr(args, "dry_run", False)
+
+            if dry_run:
+                print("Dry run — showing what would be deleted:\n")
+            elif not args.yes:
+                if files_only:
+                    prompt_msg = f"Clean up disk files (session transcripts, request dumps, checkpoints) older than {days} days? [y/N] "
+                elif include_files:
+                    prompt_msg = f"Delete all ended sessions older than {days} days{source_msg} AND clean up disk files? [y/N] "
+                else:
+                    prompt_msg = f"Delete all ended sessions older than {days} days{source_msg}? [y/N] "
+                if not _confirm_prompt(prompt_msg):
                     print("Cancelled.")
                     return
-            count = db.prune_sessions(older_than_days=days, source=args.source)
-            print(f"Pruned {count} session(s).")
+
+            # DB pruning (skip if --files-only)
+            if not files_only:
+                if dry_run:
+                    print(f"DB: Would prune ended sessions older than {days} days{source_msg}.")
+                    print("  (Use without --dry-run to see exact count)")
+                else:
+                    count = db.prune_sessions(older_than_days=days, source=args.source)
+                    print(f"Pruned {count} session(s) from database.")
+
+            # Disk file cleanup
+            if include_files:
+                try:
+                    from tools.session_cleanup import prune_all_artifacts, format_prune_summary
+                    hermes_home = get_hermes_home()
+                    results = prune_all_artifacts(
+                        hermes_home, db,
+                        session_retention_days=days,
+                        checkpoint_retention_days=min(days, 14),
+                        dry_run=dry_run,
+                    )
+                    summary = format_prune_summary(results)
+                    if dry_run:
+                        print(f"\nDisk files that would be cleaned:\n{summary}")
+                    else:
+                        print(f"\nDisk cleanup:\n{summary}")
+                except Exception as e:
+                    print(f"Disk cleanup failed: {e}")
 
         elif action == "rename":
             resolved_session_id = db.resolve_session_id(args.session_id)
@@ -5566,6 +5610,30 @@ For more help on a command:
             if db_path.exists():
                 size_mb = os.path.getsize(db_path) / (1024 * 1024)
                 print(f"Database size: {size_mb:.1f} MB")
+
+            # Disk artifact stats
+            hermes_home = get_hermes_home()
+            sessions_dir = hermes_home / "sessions"
+            checkpoints_dir = hermes_home / "checkpoints"
+            if sessions_dir.exists():
+                session_files = list(sessions_dir.glob("session_*.json"))
+                request_dumps = list(sessions_dir.glob("request_dump_*.json"))
+                jsonl_files = list(sessions_dir.glob("*.jsonl"))
+                session_bytes = sum(f.stat().st_size for f in session_files if f.is_file())
+                dump_bytes = sum(f.stat().st_size for f in request_dumps if f.is_file())
+                jsonl_bytes = sum(f.stat().st_size for f in jsonl_files if f.is_file())
+                print(f"\nDisk artifacts:")
+                if session_files:
+                    print(f"  Session transcripts: {len(session_files)} files ({session_bytes / (1024*1024):.1f} MB)")
+                if request_dumps:
+                    print(f"  Request dumps:       {len(request_dumps)} files ({dump_bytes / (1024*1024):.1f} MB)")
+                if jsonl_files:
+                    print(f"  Gateway transcripts: {len(jsonl_files)} files ({jsonl_bytes / (1024*1024):.1f} MB)")
+            if checkpoints_dir.exists():
+                cp_dirs = [d for d in checkpoints_dir.iterdir() if d.is_dir()]
+                if cp_dirs:
+                    print(f"  Checkpoints:         {len(cp_dirs)} directories")
+            print(f"\n  Tip: Use 'hermes sessions prune --include-files' to clean up old disk artifacts.")
 
         else:
             sessions_parser.print_help()
