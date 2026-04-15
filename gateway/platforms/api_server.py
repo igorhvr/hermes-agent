@@ -38,7 +38,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import unquote_to_bytes
+from urllib.parse import unquote_to_bytes, urlsplit
 
 try:
     from aiohttp import web
@@ -2317,7 +2317,34 @@ class APIServerAdapter(BasePlatformAdapter):
         mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
         ext = _choose_export_ext(p, mime)
         self._file_exports[file_id] = {"path": str(p), "created_at": time.time(), "ext": ext}
-        return f"{request.scheme}://{request.host}/v1/files/{file_id}{ext}"
+        authority = request.host
+
+        forced_host = (os.getenv("API_SERVER_FILE_RESPONSE_FORCE_HOST", "") or "").strip()
+        forced_port = (os.getenv("API_SERVER_FILE_RESPONSE_FORCE_PORT", "") or "").strip().lstrip(":")
+        if forced_host or forced_port:
+            # Parse request.host to preserve any existing host/port when only one
+            # override is supplied.
+            current_host = authority
+            current_port = ""
+            try:
+                parsed = urlsplit(f"//{authority}")
+                if parsed.hostname:
+                    current_host = parsed.hostname
+                if parsed.port:
+                    current_port = str(parsed.port)
+            except Exception:
+                pass
+
+            host = forced_host or current_host
+            port = forced_port or current_port
+
+            # Ensure IPv6 literals are bracketed when composing host:port.
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+
+            authority = f"{host}:{port}" if port else host
+
+        return f"{request.scheme}://{authority}/v1/files/{file_id}{ext}"
 
     @staticmethod
     def _render_media_markdown(blocks: List[Dict[str, Any]]) -> str:

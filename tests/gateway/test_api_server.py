@@ -1264,6 +1264,58 @@ class TestResponsesEndpoint:
             ), parsed.path
 
     @pytest.mark.asyncio
+    async def test_response_output_file_endpoint_uses_forced_host_and_port(self, adapter, tmp_path, monkeypatch):
+        image_path = tmp_path / "forced.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        mock_result = {
+            "final_response": f"MEDIA:{image_path}",
+            "messages": [],
+            "api_calls": 1,
+        }
+        monkeypatch.setenv("API_SERVER_FILE_RESPONSE_FORCE_HOST", "files.example.internal")
+        monkeypatch.setenv("API_SERVER_FILE_RESPONSE_FORCE_PORT", "9443")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post("/v1/responses", json={"input": "large image"})
+            assert resp.status == 200
+            data = await resp.json()
+            content_blocks = data["output"][0]["content"]
+            image_blocks = [b for b in content_blocks if b.get("type") == "output_image"]
+            assert image_blocks
+            parsed = urlparse(image_blocks[0]["image_url"])
+            assert parsed.hostname == "files.example.internal"
+            assert parsed.port == 9443
+            assert re.fullmatch(r"/v1/files/[A-Za-z0-9]+\.png", parsed.path), parsed.path
+
+    @pytest.mark.asyncio
+    async def test_response_output_file_endpoint_uses_forced_port_only(self, adapter, tmp_path, monkeypatch):
+        image_path = tmp_path / "forced-port.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        mock_result = {
+            "final_response": f"MEDIA:{image_path}",
+            "messages": [],
+            "api_calls": 1,
+        }
+        monkeypatch.setenv("API_SERVER_FILE_RESPONSE_FORCE_PORT", "9000")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post("/v1/responses", json={"input": "large image"})
+            assert resp.status == 200
+            data = await resp.json()
+            content_blocks = data["output"][0]["content"]
+            image_blocks = [b for b in content_blocks if b.get("type") == "output_image"]
+            assert image_blocks
+            parsed = urlparse(image_blocks[0]["image_url"])
+            assert parsed.port == 9000
+            assert re.fullmatch(r"/v1/files/[A-Za-z0-9]+\.png", parsed.path), parsed.path
+
+    @pytest.mark.asyncio
     async def test_instructions_as_ephemeral_prompt(self, adapter):
         """The instructions field maps to ephemeral_system_prompt."""
         mock_result = {"final_response": "Ahoy!", "messages": [], "api_calls": 1}
