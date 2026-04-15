@@ -9,6 +9,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/models                  — lists hermes-agent as an available model
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
+- GET  /v1/files/{file_id}         — download outbound media/document exports
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -21,17 +22,22 @@ Requires:
 """
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import socket as _socket
 import re
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote_to_bytes
 
 try:
     from aiohttp import web
@@ -53,10 +59,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+MAX_REQUEST_BYTES = 32_000_000  # 32 MB limit for rich OpenAI-style multimodal payloads
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+MAX_EXPORTED_FILES = 256
+FILE_EXPORT_TTL_SECONDS = 14_400
 
 
 def _normalize_chat_content(
@@ -115,6 +123,35 @@ def _normalize_chat_content(
         return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
     except Exception:
         return ""
+
+
+def _decode_data_url(data_url: str) -> tuple[str, bytes]:
+    """Decode a data URL into ``(mime_type, raw_bytes)``."""
+    if not isinstance(data_url, str) or not data_url.startswith("data:"):
+        raise ValueError("Not a data URL")
+    header, sep, payload = data_url.partition(",")
+    if not sep:
+        raise ValueError("Malformed data URL")
+    meta = header[5:]  # strip 'data:'
+    mime = "application/octet-stream"
+    if meta:
+        mime = (meta.split(";", 1)[0] or mime).strip() or mime
+    is_b64 = ";base64" in meta
+    try:
+        if is_b64:
+            raw = base64.b64decode(payload, validate=False)
+        else:
+            raw = unquote_to_bytes(payload)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"Invalid data URL payload: {exc}") from exc
+    return mime, raw
+
+
+def _ext_for_mime(mime: str, fallback: str) -> str:
+    guessed = mimetypes.guess_extension((mime or "").split(";", 1)[0].strip() or "")
+    if guessed:
+        return guessed
+    return fallback
 
 
 def check_api_server_requirements() -> bool:
@@ -395,6 +432,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._file_exports: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -558,6 +596,136 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         return agent
 
+    def _append_normalized_part(self, parts: List[str], value: str) -> None:
+        if not value:
+            return
+        current = sum(len(p) for p in parts)
+        if current >= MAX_NORMALIZED_TEXT_LENGTH:
+            return
+        remaining = MAX_NORMALIZED_TEXT_LENGTH - current
+        parts.append(value[:remaining])
+
+    async def _materialize_multimodal_source(
+        self,
+        *,
+        media_kind: str,
+        source: str,
+        filename: Optional[str] = None,
+    ) -> str:
+        """Convert URL/data URL multimodal sources into Hermes-friendly refs."""
+        source = str(source or "").strip()
+        if not source:
+            return ""
+        if not source.startswith("data:"):
+            return source
+
+        mime, raw = _decode_data_url(source)
+        if media_kind == "image":
+            from gateway.platforms.base import cache_image_from_bytes
+            return cache_image_from_bytes(raw, ext=_ext_for_mime(mime, ".jpg"))
+        if media_kind == "audio":
+            from gateway.platforms.base import cache_audio_from_bytes
+            return cache_audio_from_bytes(raw, ext=_ext_for_mime(mime, ".ogg"))
+
+        from gateway.platforms.base import cache_document_from_bytes
+        default_name = filename or f"{media_kind}_{uuid.uuid4().hex[:8]}{_ext_for_mime(mime, '.bin')}"
+        return cache_document_from_bytes(raw, default_name)
+
+    async def _normalize_multimodal_part(self, part: Dict[str, Any], item_type: str) -> str:
+        """Convert OpenAI multimodal part objects into Hermes placeholders."""
+        if item_type in {"image_url", "input_image"}:
+            raw = part.get("image_url")
+            if isinstance(raw, dict):
+                raw = raw.get("url")
+            ref = await self._materialize_multimodal_source(media_kind="image", source=str(raw or ""))
+            return f"[User sent an image: {ref}]" if ref else "[User sent an image]"
+
+        if item_type == "input_audio":
+            payload = part.get("input_audio")
+            ref = ""
+            if isinstance(payload, dict):
+                if payload.get("url"):
+                    ref = await self._materialize_multimodal_source(media_kind="audio", source=str(payload.get("url")))
+                elif payload.get("data"):
+                    fmt = str(payload.get("format") or "ogg").strip().lower() or "ogg"
+                    try:
+                        raw = base64.b64decode(str(payload.get("data")))
+                    except (binascii.Error, ValueError):
+                        raw = b""
+                    if raw:
+                        from gateway.platforms.base import cache_audio_from_bytes
+                        ref = cache_audio_from_bytes(raw, ext=f".{fmt.lstrip('.')}")
+            if not ref:
+                for k in ("audio_url", "url"):
+                    if part.get(k):
+                        ref = await self._materialize_multimodal_source(media_kind="audio", source=str(part.get(k)))
+                        break
+            return f"[User sent audio: {ref}]" if ref else "[User sent audio]"
+
+        if item_type == "input_video":
+            src = part.get("video_url") or part.get("url")
+            ref = await self._materialize_multimodal_source(
+                media_kind="video",
+                source=str(src or ""),
+                filename=part.get("filename"),
+            )
+            return f"[User sent a video: {ref}]" if ref else "[User sent a video]"
+
+        if item_type in {"input_file", "file"}:
+            filename = part.get("filename")
+            ref = ""
+            obj = part.get("file")
+            if isinstance(obj, dict):
+                filename = filename or obj.get("filename")
+                if obj.get("file_data"):
+                    ref = await self._materialize_multimodal_source(
+                        media_kind="file",
+                        source=str(obj.get("file_data")),
+                        filename=filename,
+                    )
+                elif obj.get("file_url"):
+                    ref = await self._materialize_multimodal_source(media_kind="file", source=str(obj.get("file_url")))
+            if not ref:
+                for k in ("file_url", "url"):
+                    if part.get(k):
+                        ref = await self._materialize_multimodal_source(media_kind="file", source=str(part.get(k)), filename=filename)
+                        break
+            label = "PDF document" if str(filename or "").lower().endswith(".pdf") else "file"
+            return f"[User sent a {label}: {ref}]" if ref else f"[User sent a {label}]"
+
+        return ""
+
+    async def _normalize_content_for_agent(self, content: Any) -> str:
+        """Normalize text + multimodal OpenAI parts into Hermes-friendly text."""
+        if isinstance(content, (str, int, float, bool)) or content is None:
+            return _normalize_chat_content(content)
+        if not isinstance(content, list):
+            return _normalize_chat_content(content)
+
+        items = content[:MAX_CONTENT_LIST_SIZE] if len(content) > MAX_CONTENT_LIST_SIZE else content
+        parts: List[str] = []
+        for item in items:
+            if isinstance(item, str):
+                self._append_normalized_part(parts, item)
+                continue
+            if isinstance(item, list):
+                nested = await self._normalize_content_for_agent(item)
+                self._append_normalized_part(parts, nested)
+                continue
+            if not isinstance(item, dict):
+                self._append_normalized_part(parts, _normalize_chat_content(item))
+                continue
+            item_type = str(item.get("type") or "").strip().lower()
+            if item_type in {"text", "input_text", "output_text"}:
+                self._append_normalized_part(parts, str(item.get("text", "")))
+                continue
+            multimodal = await self._normalize_multimodal_part(item, item_type)
+            if multimodal:
+                self._append_normalized_part(parts, multimodal)
+                continue
+        result = "\n".join(p for p in parts if p)
+        return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
+
     # ------------------------------------------------------------------
     # HTTP Handlers
     # ------------------------------------------------------------------
@@ -635,7 +803,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         for msg in messages:
             role = msg.get("role", "")
-            content = _normalize_chat_content(msg.get("content", ""))
+            content = await self._normalize_content_for_agent(msg.get("content", ""))
             if role == "system":
                 # Accumulate system messages
                 if system_prompt is None:
@@ -808,6 +976,8 @@ class APIServerAdapter(BasePlatformAdapter):
         final_response = result.get("final_response", "")
         if not final_response:
             final_response = result.get("error", "(No response generated)")
+        cleaned_text, media_blocks = self._extract_outbound_media_parts(request, final_response)
+        final_response = cleaned_text or final_response
 
         response_data = {
             "id": completion_id,
@@ -820,6 +990,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "message": {
                         "role": "assistant",
                         "content": final_response,
+                        "content_parts": [{"type": "output_text", "text": final_response}] + media_blocks,
                     },
                     "finish_reason": "stop",
                 }
@@ -1008,7 +1179,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     input_messages.append({"role": "user", "content": item})
                 elif isinstance(item, dict):
                     role = item.get("role", "user")
-                    content = _normalize_chat_content(item.get("content", ""))
+                    content = await self._normalize_content_for_agent(item.get("content", ""))
                     input_messages.append({"role": role, "content": content})
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
@@ -1111,7 +1282,7 @@ class APIServerAdapter(BasePlatformAdapter):
             full_history.append({"role": "assistant", "content": final_response})
 
         # Build output items (includes tool calls + final message)
-        output_items = self._extract_output_items(result)
+        output_items = self._extract_output_items(result, request)
 
         response_data = {
             "id": response_id,
@@ -1174,6 +1345,22 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "response",
             "deleted": True,
         })
+
+    async def _handle_get_file(self, request: "web.Request") -> "web.Response":
+        """GET /v1/files/{file_id} — download an exported local media/document file."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        self._prune_file_exports()
+        file_id = request.match_info["file_id"]
+        meta = self._file_exports.get(file_id)
+        if not meta:
+            return web.json_response(_openai_error("File not found", code="file_not_found"), status=404)
+        path = Path(str(meta.get("path", "")))
+        if not path.is_file():
+            self._file_exports.pop(file_id, None)
+            return web.json_response(_openai_error("File no longer available", code="file_not_found"), status=404)
+        return web.FileResponse(path)
 
     # ------------------------------------------------------------------
     # Cron jobs API
@@ -1426,8 +1613,59 @@ class APIServerAdapter(BasePlatformAdapter):
     # Output extraction helper
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _extract_output_items(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _prune_file_exports(self) -> None:
+        now = time.time()
+        expired = [k for k, v in self._file_exports.items() if (now - float(v.get("created_at", 0))) > FILE_EXPORT_TTL_SECONDS]
+        for k in expired:
+            self._file_exports.pop(k, None)
+        if len(self._file_exports) > MAX_EXPORTED_FILES:
+            oldest = sorted(self._file_exports.items(), key=lambda kv: float(kv[1].get("created_at", 0)))
+            for key, _ in oldest[: len(self._file_exports) - MAX_EXPORTED_FILES]:
+                self._file_exports.pop(key, None)
+
+    def _register_file_export(self, request: "web.Request", local_path: str) -> Optional[str]:
+        try:
+            p = Path(local_path).expanduser().resolve()
+        except Exception:
+            return None
+        if not p.is_file():
+            return None
+        self._prune_file_exports()
+        file_id = uuid.uuid4().hex
+        self._file_exports[file_id] = {"path": str(p), "created_at": time.time()}
+        return f"{request.scheme}://{request.host}/v1/files/{file_id}"
+
+    def _extract_outbound_media_parts(self, request: "web.Request", final_text: str) -> tuple[str, List[Dict[str, Any]]]:
+        from gateway.platforms.base import BasePlatformAdapter
+
+        tagged, cleaned = BasePlatformAdapter.extract_media(final_text or "")
+        bare_paths, cleaned = BasePlatformAdapter.extract_local_files(cleaned or "")
+
+        refs: List[str] = [path for path, _ in tagged] + list(bare_paths)
+        seen: set[str] = set()
+        blocks: List[Dict[str, Any]] = []
+        for ref in refs:
+            if not ref or ref in seen:
+                continue
+            seen.add(ref)
+            export_url = self._register_file_export(request, ref)
+            if not export_url:
+                continue
+            mime, _ = mimetypes.guess_type(ref)
+            mime = mime or "application/octet-stream"
+            ext = Path(ref).suffix.lower()
+            filename = Path(ref).name
+            if mime.startswith("image/") or ext in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+                blocks.append({"type": "output_image", "image_url": export_url, "mime_type": mime, "filename": filename})
+            elif mime.startswith("audio/") or ext in {".ogg", ".opus", ".mp3", ".wav", ".m4a"}:
+                blocks.append({"type": "output_audio", "audio_url": export_url, "mime_type": mime, "filename": filename})
+            elif mime.startswith("video/") or ext in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
+                blocks.append({"type": "output_video", "video_url": export_url, "mime_type": mime, "filename": filename})
+            else:
+                blocks.append({"type": "output_file", "file_url": export_url, "mime_type": mime, "filename": filename})
+        return cleaned, blocks
+
+    def _extract_output_items(self, result: Dict[str, Any], request: Optional["web.Request"] = None) -> List[Dict[str, Any]]:
         """
         Build the full output item array from the agent's messages.
 
@@ -1462,15 +1700,19 @@ class APIServerAdapter(BasePlatformAdapter):
         if not final:
             final = result.get("error", "(No response generated)")
 
+        content_blocks: List[Dict[str, Any]] = [{
+            "type": "output_text",
+            "text": final,
+        }]
+        if request is not None:
+            cleaned, media_blocks = self._extract_outbound_media_parts(request, final)
+            final = cleaned or final
+            content_blocks = [{"type": "output_text", "text": final}] + media_blocks
+
         items.append({
             "type": "message",
             "role": "assistant",
-            "content": [
-                {
-                    "type": "output_text",
-                    "text": final,
-                }
-            ],
+            "content": content_blocks,
         })
         return items
 
@@ -1594,7 +1836,16 @@ class APIServerAdapter(BasePlatformAdapter):
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
-        user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
+        if isinstance(raw_input, str):
+            user_message = raw_input
+        elif isinstance(raw_input, list) and raw_input:
+            tail = raw_input[-1]
+            if isinstance(tail, dict):
+                user_message = await self._normalize_content_for_agent(tail.get("content", ""))
+            else:
+                user_message = await self._normalize_content_for_agent(tail)
+        else:
+            user_message = ""
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
@@ -1656,13 +1907,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
             for msg in raw_input[:-1]:
                 if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
-                    content = msg["content"]
-                    if isinstance(content, list):
-                        # Flatten multi-part content blocks to text
-                        content = " ".join(
-                            part.get("text", "") for part in content
-                            if isinstance(part, dict) and part.get("type") == "text"
-                        )
+                    content = await self._normalize_content_for_agent(msg["content"])
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or run_id
@@ -1802,7 +2047,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
-            self._app = web.Application(middlewares=mws)
+            self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             self._app["api_server_adapter"] = self
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
@@ -1812,6 +2057,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            self._app.router.add_get("/v1/files/{file_id}", self._handle_get_file)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
