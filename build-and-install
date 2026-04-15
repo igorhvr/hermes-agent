@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+echo "==> Removing existing venv (if any)..."
+rm -rf ./venv
+
+echo "==> Creating venv with uv..."
+uv venv ./venv --python 3.11
+
+echo "==> Installing hermes-agent in editable mode..."
+uv pip install -e . --python ./venv/bin/python
+
+echo "==> Installing WhatsApp bridge Node dependencies..."
+BRIDGE_DIR="scripts/whatsapp-bridge"
+if [ -f "$BRIDGE_DIR/package.json" ]; then
+  # Force clean install — git deps (@whiskeysockets/baileys) can fail silently
+  rm -rf "$BRIDGE_DIR/node_modules"
+  (cd "$BRIDGE_DIR" && npm install --no-fund --no-audit)
+  echo "   ✓ WhatsApp bridge deps installed"
+else
+  echo "   ⚠ $BRIDGE_DIR/package.json not found, skipping"
+fi
+
+echo "==> Done!"
+echo ""
+echo "Try: ./venv/bin/hermes whatsapp"
