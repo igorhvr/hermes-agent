@@ -332,12 +332,10 @@ def _resolve_conversation_history(
             if instructions is None:
                 instructions = stored.get("instructions")
     if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
+        from gateway.platforms.api_server import _normalize_chat_content
         for msg in raw_input[:-1]:
             if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
-                content = msg["content"]
-                if isinstance(content, list):  # flatten multi-part content blocks to text
-                    content = " ".join(p.get("text", "") for p in content
-                                       if isinstance(p, dict) and p.get("type") == "text")
+                content = _normalize_chat_content(msg["content"])
                 conversation_history.append({"role": msg["role"], "content": str(content)})
     return conversation_history, instructions, stored_session_id, None
 
@@ -531,8 +529,14 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         return _json_error(_openai_error, "Missing 'input' field", status=400)
     if isinstance(raw_input, str):
         user_message = raw_input
+    elif isinstance(raw_input, list) and raw_input:
+        tail = raw_input[-1]
+        if isinstance(tail, dict):
+            user_message = _api_server._normalize_chat_content(tail.get("content", ""))
+        else:
+            user_message = _api_server._normalize_chat_content(tail)
     else:
-        user_message = raw_input[-1].get("content", "") if isinstance(raw_input, list) else ""
+        user_message = ""
     if not user_message:
         return _json_error(_openai_error, "No user message found in input", status=400)
     try:

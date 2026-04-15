@@ -726,6 +726,12 @@ class OpenAICompatRoutesMixin:
         result, usage = outcome
         presentation_muted = result.get("_notification_presentation_suppressed") is True
         final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        if not final_response:
+            final_response = ""
+        cleaned_text, media_blocks, media_markdown = self._extract_outbound_media_parts(request, final_response)
+        final_response = cleaned_text or final_response
+        if media_markdown:
+            final_response = f"{final_response}\n\n{media_markdown}".strip()
         completed, is_partial, is_failed, err_msg = _result_flags(result)
         if err_msg:
             err_msg = _redact_api_error_text(err_msg)
@@ -751,7 +757,8 @@ class OpenAICompatRoutesMixin:
         response_data = {
             "id": completion_id, "object": "chat.completion", "created": created,
             "model": model_name,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "" if presentation_muted else final_response},
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "" if presentation_muted else final_response,
+                         "content_parts": [{"type": "output_text", "text": final_response}] + media_blocks},
                          "finish_reason": finish_reason}],
             "usage": _chat_usage_payload(usage)}
         # Non-streaming twin of ``delta.reasoning_content`` (#99552).
@@ -819,15 +826,27 @@ class OpenAICompatRoutesMixin:
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
         gateway_session_key: str = None) -> "web.StreamResponse":
         """Stream ``chat.completion.chunk`` frames from the agent's delta queue. On client
-        disconnect the agent is interrupted (stops LLM calls), then its task wrapper cancelled."""
+        disconnect the agent is interrupted (stops LLM calls), then its task wrapper cancelled.
+        Inline ``data:`` URLs are rewritten to ``/v1/files/...`` URLs before reaching the client."""
         from gateway.platforms.api_server import (
-            _abandon_agent_task, _chat_usage_payload, _sse_frame)
+            _abandon_agent_task, _chat_usage_payload, _sse_frame, _StreamDataURLFilter)
         response = await self._prepare_sse_response(request, session_id, gateway_session_key)
+        # Filter intercepts data:<mime>;base64,... substrings before they reach the client:
+        # each complete data URL is decoded, cached, registered and replaced by /v1/files/{id}.ext.
+        stream_filter = _StreamDataURLFilter(self, request)
 
         def _chunk(delta: Dict[str, Any], finish_reason=None, **extra) -> Dict[str, Any]:
             return {"id": completion_id, "object": "chat.completion.chunk", "created": created,
                     "model": model,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
+
+        async def _emit_text(text: str) -> float:
+            """Write a plain text chunk as an OpenAI ``delta.content`` event, bypassing the
+            data-URL filter (used for the filter's flush() output and the media markdown tail)."""
+            if not text:
+                return time.monotonic()
+            await response.write(_sse_frame(_chunk({"content": text})))
+            return time.monotonic()
         try:
             await response.write(_sse_frame(_chunk({"role": "assistant"})))
             async for delta in _iter_stream_items(stream_q, agent_task, response):
@@ -842,15 +861,28 @@ class OpenAICompatRoutesMixin:
                     await response.write(_sse_frame(_chunk({"reasoning_content": delta[1]})))
                 elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__status__":
                     await response.write(_sse_frame(delta[1], event="hermes.status"))
-                else:
-                    await response.write(_sse_frame(_chunk({"content": delta})))
+                elif isinstance(delta, str):
+                    safe = stream_filter.feed(delta)
+                    if safe:
+                        await _emit_text(safe)
+            # Flush any text the data-URL filter was still holding back (trailing characters
+            # buffered against a split ``data:`` prefix, or an in-progress data URL at EOS).
+            tail = stream_filter.flush()
+            if tail:
+                await _emit_text(tail)
             # The agent can fail after the queue drains (task raises / result flagged failed or
             # partial): surface a non-"stop" finish_reason like the non-streaming path.
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
             result = agent_error = None
+            media_markdown = ""
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
+                final_response = ""
+                if isinstance(result, dict):
+                    final_response = result.get("final_response", "") or result.get("error", "")
+                if final_response:
+                    _, _, media_markdown = self._extract_outbound_media_parts(request, final_response)
             except Exception as exc:
                 agent_error = exc
                 logger.error("Agent task %s failed during SSE streaming: %s", completion_id, exc)
@@ -859,6 +891,8 @@ class OpenAICompatRoutesMixin:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
             finish_reason = _finish_reason(completed, is_partial, is_failed, err_msg, agent_error)
+            if media_markdown:
+                await _emit_text(f"\n\n{media_markdown}")
             finish_chunk = _chunk({}, finish_reason, usage=_chat_usage_payload(usage))
             presentation_muted = (
                 (isinstance(result, dict) and result.get("_notification_presentation_suppressed") is True)
@@ -1110,7 +1144,7 @@ class OpenAICompatRoutesMixin:
         response_data = {
             "id": response_id, "object": "response", "status": "completed",
             "created_at": created_at, "model": body.get("model", self._model_name),
-            "output": self._extract_output_items(result, start_index=output_start_index),
+            "output": self._extract_output_items(result, request, start_index=output_start_index),
             "usage": _responses_usage_payload(usage)}
         if store:
             self._response_store.put(response_id, {
@@ -1209,10 +1243,10 @@ class OpenAICompatRoutesMixin:
                 out.append(projected)
         return out
 
-    @staticmethod
-    def _extract_output_items(result: Dict[str, Any], start_index: int = 0) -> List[Dict[str, Any]]:
+    def _extract_output_items(self, result: Dict[str, Any], request: Optional["web.Request"] = None, start_index: int = 0) -> List[Dict[str, Any]]:
         """Output items from ``result["messages"][start_index:]``: ``function_call`` per assistant
-        tool_call, ``function_call_output`` per tool message, then the final ``message``."""
+        tool_call, ``function_call_output`` per tool message, then the final ``message`` with
+        structured outbound media blocks (served via /v1/files) when a request is available."""
         from gateway.platforms.api_server import _redact_api_error_text
         items: List[Dict[str, Any]] = []
         messages = result.get("messages", [])
@@ -1242,5 +1276,12 @@ class OpenAICompatRoutesMixin:
                     "output": msg.get("content", "")})
         final = result.get("final_response", "") or _redact_api_error_text(
             result.get("error", "(No response generated)"))
-        items.append(_message_item(final))
+        content_blocks: List[Dict[str, Any]] = [{"type": "output_text", "text": final}]
+        if request is not None:
+            cleaned, media_blocks, markdown = self._extract_outbound_media_parts(request, final)
+            final = cleaned or final
+            if markdown:
+                final = f"{final}\n\n{markdown}".strip()
+            content_blocks = [{"type": "output_text", "text": final}] + media_blocks
+        items.append({"type": "message", "role": "assistant", "content": content_blocks})
         return items
