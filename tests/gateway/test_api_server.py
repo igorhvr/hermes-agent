@@ -14,8 +14,11 @@ Tests cover:
 
 import asyncio
 import json
+import re
 import time
 import uuid
+from pathlib import Path
+from urllib.parse import urlparse
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,10 +28,12 @@ from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    MAX_REQUEST_BYTES,
     ResponseStore,
     _IdempotencyCache,
     _CORS_HEADERS,
     _derive_chat_session_id,
+    body_limit_middleware,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -307,8 +312,8 @@ def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
 
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app from the adapter (without starting the full server)."""
-    mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
-    app = web.Application(middlewares=mws)
+    mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+    app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
     app["api_server_adapter"] = adapter
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
@@ -318,6 +323,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    app.router.add_get(
+        r"/v1/files/{file_id:[A-Za-z0-9]+}{ext:(?:\.[A-Za-z0-9]{1,8})?}",
+        adapter._handle_get_file,
+    )
     return app
 
 
@@ -419,6 +428,69 @@ class TestHealthDetailedEndpoint:
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
+
+
+class TestRequestBodyLimits:
+    @pytest.mark.asyncio
+    async def test_rejects_content_length_over_32mb(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                data=b"{}",
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(MAX_REQUEST_BYTES + 1),
+                },
+            )
+            assert resp.status == 413
+
+    @pytest.mark.asyncio
+    async def test_app_sets_client_max_size_to_32mb(self, adapter):
+        app = _create_app(adapter)
+        assert app._client_max_size == MAX_REQUEST_BYTES
+
+class TestChooseExportExt:
+    """Covers the helper that picks a URL-safe extension for outbound
+    /v1/files/{id}.ext URLs."""
+
+    def test_prefers_on_disk_suffix(self, tmp_path):
+        from gateway.platforms.api_server import _choose_export_ext
+        p = tmp_path / "voice.ogg"
+        p.write_bytes(b"OggS\x00\x00")
+        # Even though audio/ogg → mimetypes might return .ogx or similar on
+        # some platforms, the real file extension wins.
+        assert _choose_export_ext(p, "audio/ogg") == ".ogg"
+
+    def test_lowercases_extension(self, tmp_path):
+        from gateway.platforms.api_server import _choose_export_ext
+        p = tmp_path / "PHOTO.JPG"
+        p.write_bytes(b"\xff\xd8\xff")
+        assert _choose_export_ext(p, "image/jpeg") == ".jpg"
+
+    def test_falls_back_to_mime_guess_when_no_suffix(self, tmp_path):
+        from gateway.platforms.api_server import _choose_export_ext
+        p = tmp_path / "suffixless"
+        p.write_bytes(b"\x89PNG\r\n\x1a\n")
+        # mimetypes.guess_extension("image/png") is ".png" on all
+        # platforms shipped with Python 3.12.
+        assert _choose_export_ext(p, "image/png") == ".png"
+
+    def test_returns_empty_when_suffix_looks_unsafe(self, tmp_path):
+        from gateway.platforms.api_server import _choose_export_ext
+        # A suffix that's too long / has weird chars is dropped rather
+        # than propagated into the URL.  We fall through to the MIME
+        # table, and if that also fails we return "".
+        p = tmp_path / "thing.thisextensionisfartoolong"
+        p.write_bytes(b"x")
+        assert _choose_export_ext(p, "application/x-nonexistent-zzz") == ""
+
+    def test_empty_when_nothing_works(self, tmp_path):
+        from gateway.platforms.api_server import _choose_export_ext
+        p = tmp_path / "bare"
+        p.write_bytes(b"x")
+        # Unknown MIME → no guess → never invent an extension.
+        assert _choose_export_ext(p, "application/x-nonexistent-zzz") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -741,6 +813,33 @@ class TestChatCompletionsEndpoint:
                 assert '"label": "Python docs"' in body
 
     @pytest.mark.asyncio
+    async def test_stream_appends_media_markdown_for_openwebui(self, adapter, tmp_path):
+        image_path = tmp_path / "stream.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("Done.")
+                return (
+                    {"final_response": f"Done.\nMEDIA:{image_path}", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"messages": [{"role": "user", "content": "stream"}], "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "Done." in body
+                assert "/v1/files/" in body
+                assert "![stream.png]" in body
+
+    @pytest.mark.asyncio
     async def test_no_user_message_returns_400(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -752,6 +851,31 @@ class TestChatCompletionsEndpoint:
                 },
             )
             assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_nonstream_media_response_includes_openwebui_markdown(self, adapter, tmp_path):
+        image_path = tmp_path / "demo.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        mock_result = {
+            "final_response": f"Generated.\nMEDIA:{image_path}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "make image"}]},
+                )
+            assert resp.status == 200
+            data = await resp.json()
+            text = data["choices"][0]["message"]["content"]
+            assert "MEDIA:" not in text
+            assert "![" in text and "/v1/files/" in text
+            assert "data:image/" not in text
 
     @pytest.mark.asyncio
     async def test_successful_completion(self, adapter):
@@ -782,6 +906,7 @@ class TestChatCompletionsEndpoint:
             assert len(data["choices"]) == 1
             assert data["choices"][0]["message"]["role"] == "assistant"
             assert data["choices"][0]["message"]["content"] == "Hello! How can I help you today?"
+            assert data["choices"][0]["message"]["content_parts"][0]["type"] == "output_text"
             assert data["choices"][0]["finish_reason"] == "stop"
             assert "usage" in data
 
@@ -1037,6 +1162,106 @@ class TestResponsesEndpoint:
             # Last message is user_message, rest are history
             assert call_kwargs["user_message"] == "What is 2+2?"
             assert len(call_kwargs["conversation_history"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_response_output_includes_media_blocks_and_file_download(self, adapter, tmp_path):
+        audio_path = tmp_path / "voice.ogg"
+        audio_path.write_bytes(b"OggS\x00\x00")
+        mock_result = {
+            "final_response": f"[[audio_as_voice]]\nMEDIA:{audio_path}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post("/v1/responses", json={"input": "reply with audio"})
+            assert resp.status == 200
+            data = await resp.json()
+            content_blocks = data["output"][0]["content"]
+            audio_blocks = [b for b in content_blocks if b.get("type") == "output_audio"]
+            assert audio_blocks
+            # Non-image media is never inlined — it always resolves to a
+            # /v1/files/{id}.ext URL, even when the payload is tiny.
+            assert "data:audio/" not in content_blocks[0]["text"]
+            assert not audio_blocks[0]["audio_url"].startswith("data:")
+            # Extension must match the source file (voice.ogg → .ogg).
+            parsed = urlparse(audio_blocks[0]["audio_url"])
+            assert re.fullmatch(r"/v1/files/[A-Za-z0-9]+\.ogg", parsed.path), parsed.path
+
+    @pytest.mark.asyncio
+    async def test_response_output_small_images_also_use_file_endpoint(self, adapter, tmp_path):
+        """Images of any size go through /v1/files/{id}.ext — there's no
+        inline-data-URL fast-path anymore."""
+        image_path = tmp_path / "tiny.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nsmall")
+        mock_result = {
+            "final_response": f"MEDIA:{image_path}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post("/v1/responses", json={"input": "tiny image"})
+            assert resp.status == 200
+            data = await resp.json()
+            content_blocks = data["output"][0]["content"]
+            image_blocks = [b for b in content_blocks if b.get("type") == "output_image"]
+            assert image_blocks
+            assert not image_blocks[0]["image_url"].startswith("data:")
+            parsed = urlparse(image_blocks[0]["image_url"])
+            assert re.fullmatch(r"/v1/files/[A-Za-z0-9]+\.png", parsed.path), parsed.path
+            # Markdown fallback in the text also uses the file URL, not a
+            # base64 data URL.
+            assert "![tiny.png](" in content_blocks[0]["text"]
+            assert "/v1/files/" in content_blocks[0]["text"]
+            assert "data:image/" not in content_blocks[0]["text"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("filename", "payload"),
+        [
+            ("sample.pdf", b"%PDF-1.4\nmini\n"),
+            ("sample.zip", b"PK\x03\x04mini"),
+        ],
+    )
+    async def test_response_output_document_media_served_via_file_endpoint(
+        self, adapter, tmp_path, filename, payload,
+    ):
+        """Documents resolve to /v1/files/{id}.ext URLs, regardless of size —
+        like every other media kind, since the inline-data-URL path was
+        removed."""
+        file_path = tmp_path / filename
+        file_path.write_bytes(payload)
+        mock_result = {
+            "final_response": f"MEDIA:{file_path}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post("/v1/responses", json={"input": f"inline {filename}"})
+            assert resp.status == 200
+            data = await resp.json()
+            content_blocks = data["output"][0]["content"]
+            file_blocks = [b for b in content_blocks if b.get("type") == "output_file"]
+            assert file_blocks
+            assert not file_blocks[0]["file_url"].startswith("data:")
+            assert "data:" not in content_blocks[0]["text"]
+            # The served URL carries the real on-disk extension.
+            expected_ext = Path(filename).suffix.lower()
+            parsed = urlparse(file_blocks[0]["file_url"])
+            assert re.fullmatch(
+                rf"/v1/files/[A-Za-z0-9]+{re.escape(expected_ext)}", parsed.path,
+            ), parsed.path
 
     @pytest.mark.asyncio
     async def test_instructions_as_ephemeral_prompt(self, adapter):
@@ -1547,6 +1772,50 @@ class TestEndpointAuth:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.get("/health")
             assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_files_endpoint_allows_token_access_without_auth_header(self, auth_adapter, tmp_path):
+        export = tmp_path / "sample.txt"
+        export.write_text("hello", encoding="utf-8")
+        auth_adapter._file_exports["tok123"] = {"path": str(export), "created_at": time.time()}
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/files/tok123")
+            assert resp.status == 200
+            assert await resp.text() == "hello"
+
+    @pytest.mark.asyncio
+    async def test_files_endpoint_accepts_matching_extension(self, auth_adapter, tmp_path):
+        """A URL whose extension matches the one recorded at registration
+        time resolves the same file as the extensionless URL."""
+        export = tmp_path / "voice.ogg"
+        export.write_bytes(b"OggS\x00\x00")
+        auth_adapter._file_exports["aabb01"] = {
+            "path": str(export), "created_at": time.time(), "ext": ".ogg",
+        }
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/files/aabb01.ogg")
+            assert resp.status == 200
+            assert await resp.read() == b"OggS\x00\x00"
+
+    @pytest.mark.asyncio
+    async def test_files_endpoint_rejects_mismatched_extension(self, auth_adapter, tmp_path):
+        """A URL that guesses a different extension than the recorded one
+        returns 404 — an attacker who learns the file_id can't fish for the
+        real container format."""
+        export = tmp_path / "voice.ogg"
+        export.write_bytes(b"OggS\x00\x00")
+        auth_adapter._file_exports["aabb02"] = {
+            "path": str(export), "created_at": time.time(), "ext": ".ogg",
+        }
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/files/aabb02.mp3")
+            assert resp.status == 404
 
 
 # ---------------------------------------------------------------------------
