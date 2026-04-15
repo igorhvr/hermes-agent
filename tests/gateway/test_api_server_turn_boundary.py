@@ -10,7 +10,18 @@ this turn's output and the stored history doubled on every chained turn.
 
 from agent.agent_runtime_helpers import repair_message_sequence
 from agent.message_metadata import append_message
+from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
+
+
+def _extract_output_items(result, *, start_index: int = 0):
+    """Request-less arm of the merged instance-method ``_extract_output_items``.
+
+    The multimodal variant reads ``self._extract_outbound_media_parts`` for the
+    /v1/files export, so the upstream unbound class call no longer works; a fresh
+    adapter per test keeps module scope free of constructed state (isolation)."""
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    return adapter._extract_output_items(result, start_index=start_index)
 
 
 class _Agent:
@@ -38,7 +49,7 @@ def test_repaired_earlier_rows_keep_only_this_turn_as_output():
     result = {"messages": messages}
 
     start = APIServerAdapter._response_messages_turn_start_index(history, prompt, result)
-    items = APIServerAdapter._extract_output_items(result, start_index=start)
+    items = _extract_output_items(result, start_index=start)
     assert messages[start - 1]["content"] == prompt
     assert [i["type"] for i in items] == ["function_call", "function_call_output", "message"]
     # Stored as the agent's transcript, not client history + transcript again.
@@ -61,6 +72,6 @@ def test_compacted_transcript_keeps_only_this_turn_as_output():
     result = {"messages": messages, "_compressed": True}
 
     start = APIServerAdapter._response_messages_turn_start_index(history, "Q2", result)
-    items = APIServerAdapter._extract_output_items(result, start_index=start)
+    items = _extract_output_items(result, start_index=start)
     assert [i["type"] for i in items] == ["function_call", "function_call_output", "message"]
     assert items[0]["call_id"] == "call-current"

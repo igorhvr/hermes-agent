@@ -44,8 +44,24 @@ def _run_stream(queued, final_response):
 
 
 def test_final_response_emitted_when_no_deltas_streamed():
+    # No deltas at all: content_sent stays False and the recovery fallback
+    # emits the final_response once. The data-URL filter is a no-op here
+    # (nothing queued), so the single chunk is the whole response.
     assert _run_stream([], "recovered answer") == ["recovered answer"]
 
 
 def test_final_response_not_duplicated_after_streamed_deltas():
-    assert _run_stream(["hello ", "world"], "hello world") == ["hello ", "world"]
+    # Deltas came through, so the recovery fallback must NOT re-emit the
+    # final_response (that would duplicate it). Assert the reassembled
+    # assistant content equals the streamed text exactly, and that it
+    # appears exactly once.
+    #
+    # Note: the stream now routes plain text through the data-URL filter,
+    # which may hold back trailing characters that could begin a ``data:``
+    # prefix (e.g. "world" -> "worl" + "d"). Chunk boundaries are therefore
+    # not guaranteed to match the queued deltas byte-for-byte; the client-
+    # visible content is, which is the contract this test pins.
+    contents = _run_stream(["hello ", "world"], "hello world")
+    reassembled = "".join(contents)
+    assert reassembled == "hello world"
+    assert reassembled.count("hello world") == 1
