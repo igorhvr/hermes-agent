@@ -15,6 +15,7 @@ Tests cover:
 import json
 import time
 import uuid
+from urllib.parse import urlparse
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,9 +25,12 @@ from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    MAX_REQUEST_BYTES,
+    MAX_INLINE_MEDIA_BYTES,
     ResponseStore,
     _CORS_HEADERS,
     _derive_chat_session_id,
+    body_limit_middleware,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -216,8 +220,8 @@ def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
 
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app from the adapter (without starting the full server)."""
-    mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
-    app = web.Application(middlewares=mws)
+    mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+    app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
     app["api_server_adapter"] = adapter
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
@@ -227,6 +231,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    app.router.add_get("/v1/files/{file_id}", adapter._handle_get_file)
     return app
 
 
@@ -328,6 +333,30 @@ class TestHealthDetailedEndpoint:
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
+
+
+class TestRequestBodyLimits:
+    @pytest.mark.asyncio
+    async def test_rejects_content_length_over_32mb(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                data=b"{}",
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(MAX_REQUEST_BYTES + 1),
+                },
+            )
+            assert resp.status == 413
+
+    @pytest.mark.asyncio
+    async def test_app_sets_client_max_size_to_32mb(self, adapter):
+        app = _create_app(adapter)
+        assert app._client_max_size == MAX_REQUEST_BYTES
+
+    def test_inline_media_threshold_constant_exists(self):
+        assert MAX_INLINE_MEDIA_BYTES == 65_536
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +679,33 @@ class TestChatCompletionsEndpoint:
                 assert '"label": "Python docs"' in body
 
     @pytest.mark.asyncio
+    async def test_stream_appends_media_markdown_for_openwebui(self, adapter, tmp_path):
+        image_path = tmp_path / "stream.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("Done.")
+                return (
+                    {"final_response": f"Done.\nMEDIA:{image_path}", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"messages": [{"role": "user", "content": "stream"}], "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "Done." in body
+                assert "data:image/png;base64," in body
+                assert "![stream.png]" in body
+
+    @pytest.mark.asyncio
     async def test_no_user_message_returns_400(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -661,6 +717,113 @@ class TestChatCompletionsEndpoint:
                 },
             )
             assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_multimodal_input_image_url_becomes_placeholder(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "describe"},
+                                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+                                ],
+                            }
+                        ]
+                    },
+                )
+            assert resp.status == 200
+            assert "[User sent an image: https://example.com/cat.png]" in mock_run.call_args.kwargs["user_message"]
+
+    @pytest.mark.asyncio
+    async def test_multimodal_input_file_data_url_cached(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch("gateway.platforms.base.cache_document_from_bytes", return_value="/tmp/docs/doc_abc_invoice.pdf") as cache_doc,
+                patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+            ):
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                data_url = "data:application/pdf;base64,SGVsbG8="
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [{"type": "input_file", "filename": "invoice.pdf", "file_url": data_url}],
+                            }
+                        ]
+                    },
+                )
+            assert resp.status == 200
+            assert cache_doc.called
+            assert "[User sent a PDF document: /tmp/docs/doc_abc_invoice.pdf]" in mock_run.call_args.kwargs["user_message"]
+
+    @pytest.mark.asyncio
+    async def test_multimodal_input_audio_data_block_cached(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch("gateway.platforms.base.cache_audio_from_bytes", return_value="/tmp/audio/audio_abc.wav") as cache_audio,
+                patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+            ):
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}},
+                                ],
+                            }
+                        ]
+                    },
+                )
+            assert resp.status == 200
+            assert cache_audio.called
+            assert "[User sent audio: /tmp/audio/audio_abc.wav]" in mock_run.call_args.kwargs["user_message"]
+
+    @pytest.mark.asyncio
+    async def test_nonstream_media_response_includes_openwebui_markdown(self, adapter, tmp_path):
+        image_path = tmp_path / "demo.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        mock_result = {
+            "final_response": f"Generated.\nMEDIA:{image_path}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "make image"}]},
+                )
+            assert resp.status == 200
+            data = await resp.json()
+            text = data["choices"][0]["message"]["content"]
+            assert "MEDIA:" not in text
+            assert "![" in text and "data:image/png;base64," in text
 
     @pytest.mark.asyncio
     async def test_successful_completion(self, adapter):
@@ -691,6 +854,7 @@ class TestChatCompletionsEndpoint:
             assert len(data["choices"]) == 1
             assert data["choices"][0]["message"]["role"] == "assistant"
             assert data["choices"][0]["message"]["content"] == "Hello! How can I help you today?"
+            assert data["choices"][0]["message"]["content_parts"][0]["type"] == "output_text"
             assert data["choices"][0]["finish_reason"] == "stop"
             assert "usage" in data
 
@@ -948,6 +1112,133 @@ class TestResponsesEndpoint:
             assert len(call_kwargs["conversation_history"]) == 1
 
     @pytest.mark.asyncio
+    async def test_responses_multimodal_normalizes_video_and_file_parts(self, adapter):
+        mock_result = {"final_response": "done", "messages": [], "api_calls": 1}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_video", "video_url": "https://cdn.example.com/demo.mp4"},
+                                    {"type": "file", "file": {"file_url": "https://cdn.example.com/spec.pdf", "filename": "spec.pdf"}},
+                                ],
+                            }
+                        ]
+                    },
+                )
+            assert resp.status == 200
+            user_message = mock_run.call_args.kwargs["user_message"]
+            assert "[User sent a video: https://cdn.example.com/demo.mp4]" in user_message
+            assert "[User sent a PDF document: https://cdn.example.com/spec.pdf]" in user_message
+
+    @pytest.mark.asyncio
+    async def test_response_output_includes_media_blocks_and_file_download(self, adapter, tmp_path):
+        audio_path = tmp_path / "voice.ogg"
+        audio_path.write_bytes(b"OggS\x00\x00")
+        mock_result = {
+            "final_response": f"[[audio_as_voice]]\nMEDIA:{audio_path}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post("/v1/responses", json={"input": "reply with audio"})
+            assert resp.status == 200
+            data = await resp.json()
+            content_blocks = data["output"][0]["content"]
+            audio_blocks = [b for b in content_blocks if b.get("type") == "output_audio"]
+            assert audio_blocks
+            assert "data:audio/ogg;base64," in content_blocks[0]["text"]
+            assert audio_blocks[0]["audio_url"].startswith("data:audio/ogg;base64,")
+
+    @pytest.mark.asyncio
+    async def test_response_output_inlines_small_images_as_data_urls(self, adapter, tmp_path):
+        image_path = tmp_path / "tiny.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nsmall")
+        mock_result = {
+            "final_response": f"MEDIA:{image_path}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post("/v1/responses", json={"input": "tiny image"})
+            assert resp.status == 200
+            data = await resp.json()
+            content_blocks = data["output"][0]["content"]
+            image_blocks = [b for b in content_blocks if b.get("type") == "output_image"]
+            assert image_blocks
+            assert image_blocks[0]["image_url"].startswith("data:image/png;base64,")
+            assert "![tiny.png](data:image/png;base64," in content_blocks[0]["text"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("filename", "payload", "expected_prefix"),
+        [
+            ("sample.pdf", b"%PDF-1.4\nmini\n", "data:application/pdf;base64,"),
+            ("sample.zip", b"PK\x03\x04mini", "data:application/zip;base64,"),
+        ],
+    )
+    async def test_response_output_inlines_small_document_media_as_data_urls(
+        self, adapter, tmp_path, filename, payload, expected_prefix,
+    ):
+        file_path = tmp_path / filename
+        file_path.write_bytes(payload)
+        mock_result = {
+            "final_response": f"MEDIA:{file_path}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post("/v1/responses", json={"input": f"inline {filename}"})
+            assert resp.status == 200
+            data = await resp.json()
+            content_blocks = data["output"][0]["content"]
+            file_blocks = [b for b in content_blocks if b.get("type") == "output_file"]
+            assert file_blocks
+            assert file_blocks[0]["file_url"].startswith(expected_prefix)
+            assert expected_prefix in content_blocks[0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_response_output_uses_file_endpoint_for_large_images(self, adapter, tmp_path):
+        image_path = tmp_path / "large.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * (MAX_INLINE_MEDIA_BYTES + 8))
+        mock_result = {
+            "final_response": f"MEDIA:{image_path}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post("/v1/responses", json={"input": "large image"})
+            assert resp.status == 200
+            data = await resp.json()
+            content_blocks = data["output"][0]["content"]
+            image_blocks = [b for b in content_blocks if b.get("type") == "output_image"]
+            assert image_blocks
+            assert "/v1/files/" in image_blocks[0]["image_url"]
+
+    @pytest.mark.asyncio
     async def test_instructions_as_ephemeral_prompt(self, adapter):
         """The instructions field maps to ephemeral_system_prompt."""
         mock_result = {"final_response": "Ahoy!", "messages": [], "api_calls": 1}
@@ -1154,6 +1445,18 @@ class TestEndpointAuth:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.get("/health")
             assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_files_endpoint_allows_token_access_without_auth_header(self, auth_adapter, tmp_path):
+        export = tmp_path / "sample.txt"
+        export.write_text("hello", encoding="utf-8")
+        auth_adapter._file_exports["tok123"] = {"path": str(export), "created_at": time.time()}
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/files/tok123")
+            assert resp.status == 200
+            assert await resp.text() == "hello"
 
 
 # ---------------------------------------------------------------------------
