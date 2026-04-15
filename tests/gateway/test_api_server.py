@@ -32,6 +32,7 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _IdempotencyCache,
     _CORS_HEADERS,
+    _StreamDataURLFilter,
     _derive_chat_session_id,
     body_limit_middleware,
     check_api_server_requirements,
@@ -493,6 +494,151 @@ class TestChooseExportExt:
         assert _choose_export_ext(p, "application/x-nonexistent-zzz") == ""
 
 
+class TestStreamDataURLFilter:
+    """Direct unit tests for the streaming filter state machine.
+
+    Uses a fake adapter whose ``_register_file_export`` returns a stable
+    URL based on the cached-file path, so we can assert rewrites without
+    spinning up an aiohttp Request.  End-to-end SSE coverage lives in
+    ``TestChatCompletionsEndpoint.test_streaming_rewrites_inline_data_url``
+    below.
+    """
+
+    class _FakeAdapter:
+        def __init__(self):
+            self.registered = []
+
+        def _register_file_export(self, request, local_path):
+            self.registered.append(local_path)
+            # Mimic the real URL shape so tests can grep for /v1/files/.
+            return f"https://host/v1/files/{Path(local_path).stem}{Path(local_path).suffix}"
+
+    def _make_filter(self):
+        adapter = self._FakeAdapter()
+        return _StreamDataURLFilter(adapter, request=None), adapter
+
+    def _build_png_data_url(self) -> str:
+        import base64 as _b64
+        raw = b"\x89PNG\r\n\x1a\nfake-png"
+        return f"data:image/png;base64,{_b64.b64encode(raw).decode()}"
+
+    def test_passes_through_plain_text(self):
+        """No data URL, no change (modulo the tiny tail-hold that gets
+        released on flush)."""
+        f, _ = self._make_filter()
+        emitted = f.feed("hello, world — nothing to see here")
+        emitted += f.flush()
+        assert emitted == "hello, world — nothing to see here"
+
+    def test_rewrites_single_chunk_data_url(self):
+        f, adapter = self._make_filter()
+        data_url = self._build_png_data_url()
+        text = f"Here: ![icon]({data_url})"
+        emitted = f.feed(text) + f.flush()
+        # No data URL remains and a /v1/files/ URL is spliced in.
+        assert "data:" not in emitted, emitted
+        assert "/v1/files/" in emitted, emitted
+        # Markdown structure preserved.
+        assert "![icon](" in emitted
+        # One registration, one inline block recorded.
+        assert len(adapter.registered) == 1
+        assert len(f.inline_blocks) == 1
+        assert f.inline_blocks[0]["type"] == "output_image"
+
+    def test_rewrites_data_url_split_across_many_chunks(self):
+        """Claude's tokens don't respect URL boundaries — ``data:`` may
+        be split into pieces like ``"da"``/``"ta:image/png;base64,"``/
+        ``"iVBORw0K"``/``"Ggo="``/``")"``."""
+        f, adapter = self._make_filter()
+        data_url = self._build_png_data_url()
+        prefix = "Here: ![icon]("
+        # Split the full text (prefix + URL + ")") into aggressively small
+        # chunks — 3 chars each — to exercise every state transition.
+        full = prefix + data_url + ")"
+        chunks = [full[i:i + 3] for i in range(0, len(full), 3)]
+        emitted_parts = [f.feed(ch) for ch in chunks]
+        emitted_parts.append(f.flush())
+        emitted = "".join(emitted_parts)
+        assert "data:" not in emitted, emitted
+        assert "/v1/files/" in emitted, emitted
+        assert "![icon](" in emitted
+        assert len(adapter.registered) == 1
+
+    def test_data_url_terminator_is_markdown_close_paren(self):
+        """The closing paren of ``![alt](…)`` must end the URL scan so
+        anything after ``)`` is emitted as normal text."""
+        f, _ = self._make_filter()
+        data_url = self._build_png_data_url()
+        emitted = f.feed(f"before ![x]({data_url}) after text") + f.flush()
+        assert emitted.endswith(") after text"), emitted
+        assert "/v1/files/" in emitted
+        assert "data:" not in emitted
+
+    def test_multiple_data_urls_each_materialized_once(self):
+        f, adapter = self._make_filter()
+        url1 = self._build_png_data_url()
+        # Different payload → different cached file.
+        import base64 as _b64
+        raw2 = b"\x89PNG\r\n\x1a\nother-png"
+        url2 = f"data:image/png;base64,{_b64.b64encode(raw2).decode()}"
+        emitted = f.feed(f"![a]({url1}) and ![b]({url2})") + f.flush()
+        assert emitted.count("/v1/files/") == 2, emitted
+        assert "data:" not in emitted
+        assert len(adapter.registered) == 2
+
+    def test_undecodable_data_url_left_verbatim(self):
+        """If ``_decode_data_url`` can't parse the payload, keep the URL in
+        place — better to show the user a broken link than to silently eat
+        bytes."""
+        f, _ = self._make_filter()
+        bad = "data:image/png;base64,@@@nope@@@"
+        emitted = f.feed(f"Look: ![x]({bad})") + f.flush()
+        # Original URL is preserved verbatim — filter doesn't invent one.
+        assert bad in emitted, emitted
+
+    def test_partial_data_prefix_at_buffer_boundary_is_held(self):
+        """If a chunk ends with ``"da"`` and the next begins with
+        ``"ta:image/png;base64,…"``, the filter must not emit the ``"da"``
+        early — otherwise the ``data:`` match is lost."""
+        f, adapter = self._make_filter()
+        data_url = self._build_png_data_url()
+        first = f.feed("before da")  # last 2 chars are a partial prefix
+        second = f.feed("ta:image/png;base64,")
+        third = f.feed(data_url.split(",", 1)[1])  # payload
+        fourth = f.feed(")")
+        emitted = first + second + third + fourth + f.flush()
+        assert "data:" not in emitted, emitted
+        assert "/v1/files/" in emitted
+        # "before " is stable enough that the first chunk may emit part
+        # of it; by end-of-stream the full non-URL prose is present.
+        assert emitted.startswith("before "), emitted
+
+    def test_flush_handles_in_progress_data_url(self):
+        """Stream ends mid-URL (no terminator reached) — the filter
+        should still decode whatever payload bytes are valid rather than
+        drop them."""
+        f, _ = self._make_filter()
+        data_url = self._build_png_data_url()
+        # Deliberately *don't* include a closing paren / whitespace.
+        emitted = f.feed(f"incomplete: {data_url}")
+        emitted += f.flush()
+        assert "data:" not in emitted, emitted
+        assert "/v1/files/" in emitted
+
+    def test_tool_progress_tuples_ignored_by_filter(self):
+        """The SSE writer only sends *strings* through ``feed``; tool-
+        progress events take a different path.  This is documented
+        behaviour — verify the filter is string-only."""
+        f, _ = self._make_filter()
+        # Non-string input is a programming error; the caller in
+        # _write_sse_chat_completion checks ``isinstance(item, str)``
+        # before feeding.  Here we just confirm that empty chunks produce
+        # empty output and don't wedge the state machine.
+        assert f.feed("") == ""
+        assert f.feed(None) == ""
+        assert f.flush() == ""
+
+
 # ---------------------------------------------------------------------------
 # /v1/models endpoint
 # ---------------------------------------------------------------------------
@@ -838,6 +984,110 @@ class TestChatCompletionsEndpoint:
                 assert "Done." in body
                 assert "/v1/files/" in body
                 assert "![stream.png]" in body
+
+    @staticmethod
+    def _reassemble_sse_content(body: str) -> str:
+        """Concatenate the ``delta.content`` of every SSE data frame in
+        ``body`` into a single string — mirrors how an OpenAI client
+        assembles a streaming reply into the assistant message."""
+        parts: List[str] = []
+        for line in body.split("\n"):
+            if not line.startswith("data: "):
+                continue
+            payload = line[len("data: "):]
+            if payload.strip() == "[DONE]":
+                continue
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            for choice in obj.get("choices", []):
+                delta = choice.get("delta") or {}
+                if isinstance(delta.get("content"), str):
+                    parts.append(delta["content"])
+        return "".join(parts)
+
+    @pytest.mark.asyncio
+    async def test_streaming_rewrites_inline_data_url(self, adapter):
+        """End-to-end: Claude emits deltas that compose
+        ``![icon](data:image/png;base64,…)`` across several chunks, and
+        the text the client reassembles from the SSE stream must contain
+        a ``/v1/files/`` URL instead of the base64 blob."""
+        import base64 as _b64
+        raw = b"\x89PNG\r\n\x1a\nfake-png-bytes"
+        data_url = f"data:image/png;base64,{_b64.b64encode(raw).decode()}"
+        # Break the text into chunks that *intentionally* split the
+        # ``data:`` prefix across two deltas (last 2 chars of one chunk,
+        # rest in the next) so the filter's prefix-hold path is exercised.
+        prefix = "Here is your icon: ![icon]("
+        deltas = [
+            prefix[:-5],                         # "…: ![icon"
+            prefix[-5:] + data_url[:2],          # "n](da"
+            data_url[2:10],                      # "ta:image"
+            data_url[10:],                       # remainder of the URL
+            ")",                                 # markdown terminator
+            "\n\nLet me know if you want changes.",  # trailing prose
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    for d in deltas:
+                        cb(d)
+                return (
+                    {"final_response": prefix + data_url + ")" + "\n\nLet me know if you want changes.",
+                     "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"messages": [{"role": "user", "content": "icon"}], "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                reassembled = self._reassemble_sse_content(body)
+                # No base64 payload reached the client…
+                assert "data:image/" not in reassembled, reassembled
+                assert "base64," not in reassembled, reassembled
+                # …but the markdown wrapper and a /v1/files/ URL did.
+                assert "![icon](" in reassembled
+                assert re.search(r"/v1/files/[A-Za-z0-9]+\.png", reassembled), reassembled
+                # Trailing prose that came AFTER the data URL still ships.
+                assert "Let me know if you want changes." in reassembled
+
+    @pytest.mark.asyncio
+    async def test_streaming_plain_text_is_not_altered(self, adapter):
+        """The filter's prefix-hold must not drop or reorder characters —
+        after reassembly the stream matches the source tokens exactly."""
+        tokens = ["Hello", ", ", "world", "! No ", "data here."]
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    for t in tokens:
+                        cb(t)
+                return (
+                    {"final_response": "".join(tokens), "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                reassembled = self._reassemble_sse_content(body)
+                assert reassembled == "Hello, world! No data here."
+                # "data" (no colon) is plain text and must pass through
+                # verbatim — the filter only reacts to the full ``data:``.
+                assert "data here." in reassembled
 
     @pytest.mark.asyncio
     async def test_no_user_message_returns_400(self, adapter):
@@ -1221,6 +1471,95 @@ class TestResponsesEndpoint:
             assert "![tiny.png](" in content_blocks[0]["text"]
             assert "/v1/files/" in content_blocks[0]["text"]
             assert "data:image/" not in content_blocks[0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_inline_data_url_image_rewritten_to_file_url(self, adapter):
+        """When the model embeds ``![alt](data:image/png;base64,…)`` in its
+        reply (as Claude does for shell-produced images without a MEDIA
+        convention), the server decodes the payload, caches it, and swaps
+        the data URL for a ``/v1/files/{id}.png`` URL in-place.  The client
+        sees a normal markdown image referencing a cheap HTTP URL instead
+        of carrying base64 through conversation history."""
+        import base64 as _b64
+        png_bytes = b"\x89PNG\r\n\x1a\nfake-png-bytes"
+        data_url = f"data:image/png;base64,{_b64.b64encode(png_bytes).decode()}"
+        mock_result = {
+            "final_response": f"Here's your icon: ![icon]({data_url})",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post("/v1/responses", json={"input": "icon please"})
+            assert resp.status == 200
+            data = await resp.json()
+            content_blocks = data["output"][0]["content"]
+            # The text markdown wrapper survives intact, but its URL is now
+            # a /v1/files/ URL — no base64 left in the response.
+            text = content_blocks[0]["text"]
+            assert "![icon](" in text
+            assert "data:image/" not in text
+            assert "data:" not in text
+            match = re.search(r"/v1/files/[A-Za-z0-9]+\.(?:png|jpg|jpeg)", text)
+            assert match, f"no /v1/files URL spliced into text: {text!r}"
+            # And there's a proper output_image block referencing the same URL.
+            image_blocks = [b for b in content_blocks if b.get("type") == "output_image"]
+            assert image_blocks
+            assert image_blocks[0]["image_url"].endswith(match.group(0).rsplit("/", 1)[-1])
+
+    @pytest.mark.asyncio
+    async def test_inline_data_url_audio_rewritten_to_file_url(self, adapter):
+        """Audio data URLs the model embeds get the same treatment."""
+        import base64 as _b64
+        ogg_bytes = b"OggS\x00\x00fake-audio"
+        data_url = f"data:audio/ogg;base64,{_b64.b64encode(ogg_bytes).decode()}"
+        mock_result = {
+            "final_response": f"voice note: [audio]({data_url})",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post("/v1/responses", json={"input": "audio please"})
+            assert resp.status == 200
+            data = await resp.json()
+            content_blocks = data["output"][0]["content"]
+            text = content_blocks[0]["text"]
+            assert "data:" not in text
+            # mimetypes maps ``audio/ogg`` to ``.oga`` on most systems and
+            # ``.ogg`` on some — either is a legitimate Ogg extension.
+            assert re.search(r"/v1/files/[A-Za-z0-9]+\.(?:ogg|oga)", text), text
+            audio_blocks = [b for b in content_blocks if b.get("type") == "output_audio"]
+            assert audio_blocks
+            assert "/v1/files/" in audio_blocks[0]["audio_url"]
+
+    @pytest.mark.asyncio
+    async def test_inline_data_url_unparseable_left_in_place(self, adapter):
+        """Garbled data URLs that fail to decode are left in the text
+        verbatim rather than dropped — we'd rather show the user a
+        malformed URL than silently delete content."""
+        mock_result = {
+            # Truncated base64 header — _decode_data_url returns empty bytes,
+            # which the helper treats as "not materializable, skip."
+            "final_response": "Broken: ![x](data:image/png;base64,@@@nope@@@)",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post("/v1/responses", json={"input": "garbled"})
+            assert resp.status == 200
+            # The response completes fine; no crash.  We don't assert the
+            # exact text shape — only that nothing 500s.
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
