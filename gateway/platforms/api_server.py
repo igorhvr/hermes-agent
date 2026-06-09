@@ -2202,8 +2202,8 @@ class APIServerAdapter(BasePlatformAdapter):
         completed = bool(result.get("completed", True))
         err_msg = result.get("error")
         if not final_response:
-            final_response = result.get("error", "(No response generated)")
-        cleaned_text, media_blocks, media_markdown = self._extract_outbound_media_parts(request, final_response)
+            final_response = ""
+        cleaned_text, media_blocks, media_markdown = self._extract_outbound_media_parts(request, final_response or "")
         final_response = cleaned_text or final_response
         if media_markdown:
             final_response = f"{final_response}\n\n{media_markdown}".strip()
@@ -3317,7 +3317,12 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         # Build output items (includes tool calls + final message)
-        output_items = self._extract_output_items(result, request)
+        output_start_index = self._response_messages_turn_start_index(
+            conversation_history,
+            user_message,
+            result,
+        )
+        output_items = self._extract_output_items(result, request, start_index=output_start_index)
 
         response_data = {
             "id": response_id,
@@ -3860,17 +3865,19 @@ class APIServerAdapter(BasePlatformAdapter):
         markdown = self._render_media_markdown(blocks)
         return cleaned, inline_blocks + blocks, markdown
 
-    def _extract_output_items(self, result: Dict[str, Any], request: Optional["web.Request"] = None) -> List[Dict[str, Any]]:
+    def _extract_output_items(self, result: Dict[str, Any], request: Optional["web.Request"] = None, start_index: int = 0) -> List[Dict[str, Any]]:
         """
         Build the full output item array from the agent's messages.
 
-        Walks *result["messages"]* and emits:
+        Walks *result["messages"]* starting at *start_index* and emits:
         - ``function_call`` items for each tool_call on assistant messages
         - ``function_call_output`` items for each tool-role message
         - a final ``message`` item with the assistant's text reply
         """
         items: List[Dict[str, Any]] = []
         messages = result.get("messages", [])
+        if start_index > 0:
+            messages = messages[start_index:]
 
         for msg in messages:
             role = msg.get("role")
@@ -4002,61 +4009,6 @@ class APIServerAdapter(BasePlatformAdapter):
             out.append(cls._message_response(msg))
         return out
 
-    @staticmethod
-    def _extract_output_items(result: Dict[str, Any], start_index: int = 0) -> List[Dict[str, Any]]:
-        """
-        Build the output item array from the agent's messages.
-
-        Walks *result["messages"]* starting at *start_index* and emits:
-        - ``function_call`` items for each tool_call on assistant messages
-        - ``function_call_output`` items for each tool-role message
-        - a final ``message`` item with the assistant's text reply
-        """
-        items: List[Dict[str, Any]] = []
-        messages = result.get("messages", [])
-        if start_index > 0:
-            messages = messages[start_index:]
-
-        for msg in messages:
-            role = msg.get("role")
-            if role == "assistant" and msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    func = tc.get("function", {})
-                    items.append({
-                        "type": "function_call",
-                        "name": func.get("name", ""),
-                        "arguments": func.get("arguments", ""),
-                        "call_id": tc.get("id", ""),
-                    })
-            elif role == "tool":
-                items.append({
-                    "type": "function_call_output",
-                    "call_id": msg.get("tool_call_id", ""),
-                    "output": msg.get("content", ""),
-                })
-
-        # Final assistant message
-        final = result.get("final_response", "")
-        if not final:
-            final = result.get("error", "(No response generated)")
-
-        content_blocks: List[Dict[str, Any]] = [{
-            "type": "output_text",
-            "text": final,
-        }]
-        if request is not None:
-            cleaned, media_blocks, markdown = self._extract_outbound_media_parts(request, final)
-            final = cleaned or final
-            if markdown:
-                final = f"{final}\n\n{markdown}".strip()
-            content_blocks = [{"type": "output_text", "text": final}] + media_blocks
-
-        items.append({
-            "type": "message",
-            "role": "assistant",
-            "content": content_blocks,
-        })
-        return items
 
     # ------------------------------------------------------------------
     # Agent execution
