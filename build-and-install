@@ -6,11 +6,30 @@ cd "$(dirname "$0")"
 echo "==> Removing existing venv (if any)..."
 rm -rf ./venv
 
-echo "==> Creating venv with uv..."
-uv venv ./venv --python 3.11
+echo "==> Creating venv with uv (SQLite >=3.51.3 required)..."
+# SQLite 3.7.0–3.51.2 (excluding the 3.50.7 / 3.44.6 backports) carries the
+# WAL-reset corruption bug (https://sqlite.org/wal.html#walresetbug). The
+# uv-managed CPython 3.11.14 build links SQLite 3.50.4 — vulnerable — and a
+# bare "3.11" request resolves to that already-cached patch instead of
+# downloading a newer one, silently reproducing the bug. Pin >=3.11.15 (links
+# SQLite 3.53.1) so the venv is never created against a vulnerable runtime.
+uv venv ./venv --python '>=3.11.15'
+
+# Belt-and-suspenders: fail loudly instead of shipping a vulnerable runtime.
+# If a future patch regressed, or uv resolved something unexpected, stop here
+# rather than handing back a build that can corrupt state.db on WAL checkpoint.
+if ! ./venv/bin/python -c 'import sqlite3, sys; sys.exit(0 if sqlite3.sqlite_version_info >= (3, 51, 3) else 1)'; then
+  v=$(./venv/bin/python -c 'import sqlite3; print(sqlite3.sqlite_version)')
+  echo "error: venv links SQLite ${v}, vulnerable to the WAL-reset bug" >&2
+  echo "       (https://sqlite.org/wal.html#walresetbug) — pin a newer CPython patch." >&2
+  exit 1
+fi
 
 echo "==> Installing hermes-agent in editable mode..."
 uv pip install -e . --python ./venv/bin/python
+
+echo "==> Installing dev toolchain (pytest, ruff, etc.)..."
+uv pip install -e ".[dev]" --python ./venv/bin/python
 
 echo "==> Installing WhatsApp bridge Node dependencies..."
 BRIDGE_DIR="scripts/whatsapp-bridge"
