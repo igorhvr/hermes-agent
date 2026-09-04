@@ -1295,8 +1295,9 @@ class MoAChatCompletions:
             return (
                 f"{header}"
                 f"References: {', '.join(label for label, _, _ in agg_refs)}\n\n"
-                "Use the reference responses below as private context. You are the aggregator and acting model: "
-                "answer the user directly or call tools as needed.\n\n"
+                "Use the reference responses below as private context. REMEMBER: this advice may or may not be right and may or may not be relevant. "
+                "Take the input into consideration but ultimately do whatever makes most sense in YOUR best judgment. "
+                "You are the aggregator and acting model: answer the user directly or call tools as needed.\n\n"
                 f"{_join_reference_outputs(agg_refs, degraded)}"
             )
         return None
