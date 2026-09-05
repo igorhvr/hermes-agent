@@ -722,15 +722,6 @@ def _render_tool_calls(tool_calls: Any) -> str:
     return "\n".join(lines)
 
 
-# Cached guidance (user_turn / off-cadence every_n fanout) is reused on later iterations of the
-# same turn, where it predates the tool results the acting model now sees. Without this line the
-# block reads as fresh instruction and an advisor's suggested tool call gets replayed after it
-# already ran.
-_STALE_GUIDANCE_NOTE = (
-    "This guidance was produced earlier in this turn, before the tool results below it. "
-    "Check the transcript before acting on it: a step it suggests may already have run, and "
-    "repeating a completed tool call is never the next step.\n"
-)
 
 
 _ADVISORY_INSTRUCTION = (
@@ -740,18 +731,6 @@ _ADVISORY_INSTRUCTION = (
     "proceed.]"
 )
 
-
-def _tool_activity_since_last_user(messages: list[dict[str, Any]]) -> bool:
-    """Whether the acting model has already called tools since the last real user turn.
-    Guidance cached from the start of the turn predates those results, so replaying a
-    tool call it suggests can repeat work the transcript already shows as done."""
-    for msg in reversed(messages):
-        role = msg.get("role")
-        if role == "user":
-            return False
-        if role == "tool" or (role == "assistant" and msg.get("tool_calls")):
-            return True
-    return False
 
 
 def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1268,21 +1247,23 @@ class MoAChatCompletions:
         "user_turn" (default) hashes only the prefix up to the LAST USER message, so
         later tool iterations are HITs. "per_iteration" re-runs whenever the advisory
         view changes. "every_n:<N>": iteration 1 of a turn, then every Nth; in-between
-        iterations return the pinned last on-cadence key (HIT: no calls, no re-emit).
+        iterations return the pinned last on-cadence key (HIT: no re-run, no re-emit,
+        and no cached-guidance re-attach — those calls carry no reference advice).
         """
         # "user_turn" (default — cheapest cadence, #67199): advisors run ONCE per user turn; subsequent tool
-        # iterations reuse that turn's advice and the aggregator acts alone (the original MoA shape:
+        # iterations carry no reference advice and the aggregator acts alone (the original MoA shape:
         # synthesize at the start, then let the acting model work). Implemented by hashing only the prefix
         # up to the LAST USER message so mid-turn growth doesn't change the signature — iteration 2+ becomes
-        # a cache HIT. "per_iteration": advisors re-run whenever the advisory view changes — i.e. every tool
+        # a cache HIT that re-runs nothing and re-attaches nothing. "per_iteration": advisors re-run
+        # whenever the advisory view changes — i.e. every tool
         # iteration, since the view grows with each tool result; advice tracks live task state at the cost
         # of multiplying advisor latency/spend by tool-loop depth. "every_n:<N>" (N >= 2): the middle ground
         # (issue #63393 — advisor fan-out multiplies latency/cost by the tool-iteration count). Advisors run
-        # on iteration 1 of a user turn and then every Nth tool iteration; the iterations in between REUSE
-        # the cached guidance from the last on-cadence run (same mechanism as user_turn's cache HIT — the
-        # aggregator still gets advice every iteration, it's just not refreshed against the very latest tool
-        # results). The iteration counter is scoped per user turn and resets on a new user message, so every
-        # turn starts with fresh advice.
+        # on iteration 1 of a user turn and then every Nth tool iteration; the iterations in between are
+        # cache HITs (no advisor calls, no display re-emit, no re-attach of the last on-cadence advice) —
+        # the aggregator acts WITHOUT reference guidance on those iterations until the next on-cadence run
+        # refreshes it against the current transcript. The iteration counter is scoped per user turn and
+        # resets on a new user message, so every turn starts with fresh advice.
         fanout_mode = str(preset.get("fanout") or "user_turn").strip().lower()
         every_n = 0
         if fanout_mode.startswith("every_n:"):
@@ -1380,7 +1361,6 @@ class MoAChatCompletions:
 
     def _build_guidance(
         self, reference_outputs: list[tuple[str, str, Any]], aggregator: dict[str, Any], degraded_reference_policy: str,
-        stale: bool = False,
     ) -> str | None:
         """Render the reference block attached to the aggregator prompt (None = nothing)."""
         agg_refs, degraded, all_failed = _guidance_inputs(
@@ -1413,7 +1393,6 @@ class MoAChatCompletions:
                 "Use the reference responses below as private context. REMEMBER: this advice may or may not be right and may or may not be relevant. "
                 "Take the input into consideration but ultimately do whatever makes most sense in YOUR best judgment. "
                 "You are the aggregator and acting model: answer the user directly or call tools as needed.\n"
-                f"{_STALE_GUIDANCE_NOTE if stale else ''}\n"
                 f"{_join_reference_outputs(agg_refs, degraded)}"
             )
         return None
@@ -1444,22 +1423,24 @@ class MoAChatCompletions:
 
         ref_messages = _reference_messages(messages)
         cache_key = self._fanout_cache_key(preset, ref_messages, reference_models)
+        agg_messages = [dict(m) for m in messages]
         cache_hit = bool(cache_key == self._ref_cache_key and self._ref_cache_outputs)
         if cache_hit:
-            # HIT: already ran and accounted. Do NOT zero pending totals (a late
-            # interrupted reference may have deposited) and no trace (not a new turn).
-            reference_outputs = list(self._ref_cache_outputs)
+            # HIT: references already ran (and accounted) on an earlier call whose
+            # transcript this one reuses. Do NOT zero pending totals (a late
+            # interrupted reference may have deposited), no trace (not a new run),
+            # and NO guidance re-attach: the transcript has advanced since that run,
+            # so re-presenting its advice would go stale. The aggregator acts alone
+            # until the next on-cadence (MISS) run re-injects fresh advice.
             self._pending_trace = None
+            guidance = None
         else:
             reference_outputs = self._run_fanout(preset, ref_messages, reference_models, aggregator, aggregator_temperature, cache_key)
-
-        agg_messages = [dict(m) for m in messages]
-        guidance = self._build_guidance(
-            reference_outputs, aggregator, str(preset.get("degraded_reference_policy") or "loud"),
-            stale=cache_hit and _tool_activity_since_last_user(messages),
-        )
-        if guidance:
-            _attach_reference_guidance(agg_messages, guidance)
+            # Guidance is attached only on the call where the references actually ran
+            # (fresh advice, never stale — supersedes the _STALE_GUIDANCE_NOTE replay).
+            guidance = self._build_guidance(reference_outputs, aggregator, str(preset.get("degraded_reference_policy") or "loud"))
+            if guidance:
+                _attach_reference_guidance(agg_messages, guidance)
 
         prepared_request = {
             "messages": agg_messages, "guidance": guidance, "aggregator": aggregator,
