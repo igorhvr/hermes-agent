@@ -1,10 +1,13 @@
-"""Cached advisor guidance must announce that it predates the tool results below it.
+"""Cached advisor guidance is not re-attached on later iterations of a user turn.
 
-With `user_turn` (and off-cadence `every_n`) fanout the advisors run once per user turn and
-their guidance is replayed verbatim into every later iteration of that turn. A reference that
-proposes a tool call therefore keeps proposing it after the acting model already ran it and
-got an answer, which is how a clarify card gets issued twice in one turn: once answered, once
-a duplicate the user has to dismiss.
+With `user_turn` (and off-cadence `every_n`) fanout the advisors run once per user turn.
+Replaying their guidance verbatim into every later iteration of that turn reads as fresh
+instruction, so a reference that proposes a tool call keeps proposing it after the acting
+model already ran it and got an answer — which is how a clarify card gets issued twice in
+one turn: once answered, once a duplicate the user has to dismiss.
+
+The fix: guidance attaches only on the call where the references actually ran. Cached
+re-runs hand the aggregator the transcript alone.
 """
 
 from types import SimpleNamespace
@@ -70,24 +73,20 @@ def _prepared(monkeypatch, tmp_path, fanout="user_turn"):
     return first, second, ref_runs
 
 
-def test_reused_guidance_is_marked_as_predating_the_tool_results(monkeypatch, tmp_path):
-    from agent.moa_loop import _STALE_GUIDANCE_NOTE
-
+def test_cached_guidance_is_not_reattached(monkeypatch, tmp_path):
     first, second, ref_runs = _prepared(monkeypatch, tmp_path)
 
     assert len(ref_runs) == 1, "user_turn fanout reuses the first run's advisors"
-    assert _STALE_GUIDANCE_NOTE not in first["guidance"]
-    assert _STALE_GUIDANCE_NOTE in second["guidance"]
-    # The advice itself is still handed over unchanged.
-    assert "call the clarify tool with three questions" in second["guidance"]
+    assert "call the clarify tool with three questions" in first["guidance"]
+    # The cached run attaches nothing: re-presenting the advice beside newer tool
+    # results would read as fresh instruction and get the suggested call replayed.
+    assert second["guidance"] is None
 
 
-def test_fresh_guidance_carries_no_note(monkeypatch, tmp_path):
-    """per_iteration advisors see the tool result themselves, so nothing is stale."""
-    from agent.moa_loop import _STALE_GUIDANCE_NOTE
-
+def test_fresh_guidance_still_attaches(monkeypatch, tmp_path):
+    """per_iteration advisors re-run on every state change, so their guidance attaches."""
     first, second, ref_runs = _prepared(monkeypatch, tmp_path, fanout="per_iteration")
 
     assert len(ref_runs) == 2
-    assert _STALE_GUIDANCE_NOTE not in first["guidance"]
-    assert _STALE_GUIDANCE_NOTE not in second["guidance"]
+    assert "call the clarify tool with three questions" in first["guidance"]
+    assert "call the clarify tool with three questions" in second["guidance"]

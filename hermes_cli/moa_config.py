@@ -243,8 +243,9 @@ _FLAT_PRESET_KEYS = (
 # acts alone for the rest of the tool loop. "per_iteration" re-runs the advisors whenever the advisory view
 # changes — i.e. every tool iteration, so advice tracks live task state at the cost of multiplying advisor
 # spend by tool-loop depth. "every_n:<N>" (N >= 2) is the middle ground: advisors run on the first iteration
-# of each user turn and every Nth tool iteration after it; in-between iterations reuse the cached guidance
-# from the last advisor run. Also accepts the mapping form {mode: every_n, n: N}, normalized to the
+# of each user turn and every Nth tool iteration after it; the in-between iterations carry NO reference
+# advice — the aggregator acts alone there until the next on-cadence run re-injects fresh guidance against
+# the current transcript. Also accepts the mapping form {mode: every_n, n: N}, normalized to the
 # canonical string.
 def normalize_moa_config(raw: Any) -> dict[str, Any]:
     """Return validated MoA config with named presets."""
