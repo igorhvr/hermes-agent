@@ -125,12 +125,13 @@ calls in a turn. Two alternative cadences trade cost for advice freshness:
   turn.
 - `fanout: every_n:3` — the middle ground: advisors run on the **first**
   iteration of each user turn and then every **3rd** tool iteration (any
-  `N >= 2` works). Iterations in between reuse the cached guidance from the
-  last advisor run, so the aggregator still gets advice on every step — it is
-  just refreshed every N steps instead of every step. The counter resets on
-  each new user message, so every turn starts with fresh advice. The mapping
-  form `fanout: {mode: every_n, n: 3}` is also accepted and normalized to
-  the string form.
+  `N >= 2` works). The in-between iterations carry **no reference advice** —
+  the aggregator acts alone there (its context is not polluted with advice
+  that has gone stale against the latest tool results) until the next
+  on-cadence run refreshes the advice against the current transcript. The
+  counter resets on each new user message, so every turn starts with fresh
+  advice. The mapping form `fanout: {mode: every_n, n: 3}` is also accepted
+  and normalized to the string form.
 
 ```yaml
 moa:
