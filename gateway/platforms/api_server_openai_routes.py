@@ -895,13 +895,16 @@ class OpenAICompatRoutesMixin:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
             finish_reason = _finish_reason(completed, is_partial, is_failed, err_msg, agent_error)
-            if media_markdown:
-                await _emit_text(f"\n\n{media_markdown}")
-            finish_chunk = _chunk({}, finish_reason, usage=_chat_usage_payload(usage))
             presentation_muted = (
                 (isinstance(result, dict) and result.get("_notification_presentation_suppressed") is True)
                 or getattr(agent_error, "_notification_presentation_suppressed", False) is True
             )
+            # The media tail is a terminal emission: unlike the live deltas (long shipped by
+            # the time the result is stamped), it can still honor the notification-internal
+            # mute the batch path enforces, so a suppressed turn leaks no media either.
+            if media_markdown and not presentation_muted:
+                await _emit_text(f"\n\n{media_markdown}")
+            finish_chunk = _chunk({}, finish_reason, usage=_chat_usage_payload(usage))
             if finish_reason != "stop":
                 if err_msg and not presentation_muted:
                     finish_chunk["error"] = {
