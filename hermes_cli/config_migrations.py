@@ -873,6 +873,14 @@ MIGRATIONS: tuple[tuple[int, Callable[[dict[str, Any], bool], None]], ...] = (
     # 51 -> 52: browser.backend + browser.extension_control dropped, AGENT_BROWSER_* .env settings ->
     # browser.* (see config_migrations_browser.migrate_to_52).
     (52, migrate_to_52),
+    # 52 -> 53: subagent iteration cap 250 → 8192 (250 truncated long delegated investigations).
+    (53, _rewrite_stale_default(
+        section="delegation", key="max_iterations", old=250, new=8192,
+        added="delegation.max_iterations=8192 (was: 250)",
+        message=(
+            "  ✓ Raised delegation.max_iterations from 250 to 8192 — a subagent now works "
+            "through a long investigation in one run instead of truncating at 250 turns. "
+            "Set delegation.max_iterations back to 250 to restore the old cap."))),
 )
 
 #: Steps triggered by a legacy key or identifier (a renamed or retired key, a removed plugin or
