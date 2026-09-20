@@ -1857,6 +1857,34 @@ class TestChatCompletionsEndpoint:
             assert "usage" in data
 
     @pytest.mark.asyncio
+    async def test_presentation_muted_omits_content_and_content_parts(self, adapter, tmp_path):
+        """A notification-internal turn (_notification_presentation_suppressed) must leak
+        neither text nor media: ``content`` is "" and the multimodal ``content_parts``
+        extra is omitted entirely — the merge-resolution regression guard."""
+        image_path = tmp_path / "secret.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        mock_result = {
+            "final_response": f"Internal note.\nMEDIA:{image_path}",
+            "messages": [],
+            "api_calls": 1,
+            "_notification_presentation_suppressed": True,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "internal"}]},
+                )
+            assert resp.status == 200
+            data = await resp.json()
+            message = data["choices"][0]["message"]
+            assert message["content"] == ""
+            assert "content_parts" not in message
+
+    @pytest.mark.asyncio
     async def test_system_prompt_extracted(self, adapter):
         """System messages from the client are passed as ephemeral_system_prompt."""
         mock_result = {
