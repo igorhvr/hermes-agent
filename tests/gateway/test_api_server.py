@@ -1786,6 +1786,36 @@ class TestChatCompletionsEndpoint:
                 assert "data here." in reassembled
 
     @pytest.mark.asyncio
+    async def test_streaming_muted_turn_omits_terminal_media_tail(self, adapter, tmp_path):
+        """A muted turn's terminal media tail must not ship: the merge-resolution guard
+        for gating ``media_markdown`` on ``_notification_presentation_suppressed``."""
+        image_path = tmp_path / "stream-secret.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("working on it")
+                return (
+                    {"final_response": f"Done.\nMEDIA:{image_path}", "messages": [], "api_calls": 1,
+                     "_notification_presentation_suppressed": True},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"messages": [{"role": "user", "content": "internal"}], "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                reassembled = self._reassemble_sse_content(body)
+                assert "/v1/files/" not in reassembled
+                assert "stream-secret" not in reassembled
+                assert "![" not in reassembled
+
+    @pytest.mark.asyncio
     async def test_no_user_message_returns_400(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:

@@ -899,9 +899,11 @@ class OpenAICompatRoutesMixin:
                 (isinstance(result, dict) and result.get("_notification_presentation_suppressed") is True)
                 or getattr(agent_error, "_notification_presentation_suppressed", False) is True
             )
-            # The media tail is a terminal emission: unlike the live deltas (long shipped by
-            # the time the result is stamped), it can still honor the notification-internal
-            # mute the batch path enforces, so a suppressed turn leaks no media either.
+            # The media tail is a terminal emission added after the result is known, so it
+            # must honor the notification-internal mute the batch path enforces — a
+            # suppressed turn leaks no media. (Live deltas are not a separate concern:
+            # notification_turn nulls the presentation callbacks before the turn, so a
+            # muted turn never streams them in the first place.)
             if media_markdown and not presentation_muted:
                 await _emit_text(f"\n\n{media_markdown}")
             finish_chunk = _chunk({}, finish_reason, usage=_chat_usage_payload(usage))
