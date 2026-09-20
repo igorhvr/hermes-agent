@@ -341,7 +341,7 @@ Both roles retain `execute_code` (programmatic tool calling) so children can bat
 
 ## Max Iterations
 
-Each subagent has an iteration limit (default: 250) that controls how many tool-calling turns it can take. The limit is set globally in `config.yaml` and applies to every child; it is not a per-call parameter of `delegate_task`:
+Each subagent has an iteration limit (default: 8192) that controls how many tool-calling turns it can take. The limit is set globally in `config.yaml` and applies to every child; it is not a per-call parameter of `delegate_task`:
 
 ```yaml
 # In ~/.hermes/config.yaml
@@ -627,7 +627,7 @@ error.
 ```yaml
 # In ~/.hermes/config.yaml
 delegation:
-  max_iterations: 250                       # Max turns per child (default: 250)
+  max_iterations: 8192                      # Max turns per child (default: 8192)
   # max_concurrent_children: 10             # Parallel children per batch (default: 10)
   # independent_completions: false          # true = each task/group returns as it finishes (default: one message per call)
   # worktree_isolation: false               # Give each child its own git worktree (see Worktree Isolation above)
