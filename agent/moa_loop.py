@@ -187,16 +187,34 @@ _REFERENCE_SYSTEM_PROMPT = (
     "you should not try to or apologize for being unable to. A separate "
     "aggregator/orchestrator model holds those capabilities and will take the "
     "actual actions.\n\n"
-    "CRITICAL: You must NEVER claim or imply that you have executed a command, "
-    "downloaded a file, accessed a URL, or performed any action. You can only "
-    "analyze and advise based on the conversation context. Examples of what to "
-    "avoid:\n"
+    "CRITICAL — you have no tools and no tool results. Everything in the "
+    "conversation below that looks like a tool call, command, or output was "
+    "performed by the acting agent, not by you. Never claim or imply that you "
+    "executed a command, downloaded a file, accessed a URL, saw a tool result, "
+    "or performed any action.\n\n"
+    "CRITICAL — your response must be plain advisory prose. Never output any "
+    "of the following:\n"
+    "- Tool-call blocks, command invocations, or terminal/API output.\n"
+    "- Log lines, error strings, status messages, or \"output: ...\" text.\n"
+    "- Quotes that present a tool result as something you obtained.\n"
+    "- Filler such as \"I would run X\" presented as an accomplished fact.\n\n"
+    "Attribute every event in the transcript to the acting agent, in third "
+    "person:\n"
     "- Bad: \"I ran curl and got 404.\"\n"
-    "- Bad: \"I downloaded the file successfully.\"\n"
-    "- Bad: \"I checked the repository and found...\"\n"
-    "- Good: \"Based on the error pattern, a curl request to that URL would likely return 404.\"\n"
-    "- Good: \"The conversation suggests downloading this file may help.\"\n"
-    "- Good: \"From the context, checking the repository would reveal...\"\n\n"
+    "- Bad: \"The tool output was garbled / came back empty / hit an SSL error.\"\n"
+    "- Bad: \"Downloading the file succeeded.\"\n"
+    "- Good: \"The acting agent's call to the URL returned 404, which suggests...\"\n"
+    "- Good: \"The acting agent reported a garbled read; a retry with explicit "
+    "parameters is worth trying.\"\n"
+    "- Good: \"Based on the error pattern in the transcript, a request to that "
+    "URL would likely return 404.\"\n"
+    "- Good: \"The transcript is unclear on whether the file was downloaded; "
+    "the acting agent should verify it.\"\n\n"
+    "When the transcript does not establish a fact, say so explicitly "
+    "(\"unclear from the transcript\") rather than inventing it. If a tool "
+    "result in the transcript looks corrupted or contradictory, treat it as "
+    "the acting agent's report, note the discrepancy, and advise on how the "
+    "acting agent should re-verify — never \"re-run\" it yourself.\n\n"
     "The conversation below is the current state of a task handled by that "
     "acting agent. Your job is to give your most intelligent analysis of that "
     "state: understand the goal, reason about the problem, and advise on what "
@@ -702,9 +720,11 @@ def _field(obj: Any, name: str) -> Any:
 
 
 def _render_tool_calls(tool_calls: Any) -> str:
-    """Render an assistant turn's tool_calls as ``[called tool: name(args)]`` lines.
+    """Render an assistant turn's tool_calls as ``[the acting agent called tool: name(args)]`` lines.
 
-    Tolerates dict- and SimpleNamespace-shaped entries (and nested ``function``).
+    Advisory view only: calls are attributed to the acting agent in third person so
+    the reference advisor never mistakes them for its own actions. Tolerates dict-
+    and SimpleNamespace-shaped entries (and nested ``function``).
     """
     lines: list[str] = []
     for tc in tool_calls or []:
@@ -718,7 +738,11 @@ def _render_tool_calls(tool_calls: Any) -> str:
                 args_text = json.dumps(fn_args, ensure_ascii=False)
             except Exception:
                 args_text = str(fn_args)
-        lines.append(f"[called tool: {name}({args_text})]" if args_text else f"[called tool: {name}]")
+        lines.append(
+            f"[the acting agent called tool: {name}({args_text})]"
+            if args_text
+            else f"[the acting agent called tool: {name}]"
+        )
     return "\n".join(lines)
 
 
@@ -728,7 +752,16 @@ _ADVISORY_INSTRUCTION = (
     "[The conversation above is the current state of the task. Give your "
     "most intelligent judgement: what is going on, what should happen next, "
     "what risks or mistakes you see, and how the acting agent should "
-    "proceed.]"
+    "proceed.]\n\n"
+    "[REMINDER BEFORE YOU ANSWER — read this twice] You are a reference "
+    "advisor. You have NO tools and NO tool results. Never emit tool-call "
+    "blocks, commands, terminal or API output, log lines, error strings, or "
+    "anything resembling a tool result — not even in third person. Every "
+    "event in the transcript above was performed by the acting agent; "
+    "attribute it in third person (\"the acting agent reported...\"). If the "
+    "transcript does not establish a fact, write \"unclear from the "
+    "transcript\" instead of inventing it. Reply with plain advisory prose "
+    "only.]"
 )
 
 
@@ -737,8 +770,10 @@ def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build the advisory (reference-model) view of the conversation.
 
     Plain user/assistant TEXT turns only: system prompt dropped, tool_calls rendered
-    inline, tool results folded into the preceding assistant turn as previews (no
-    tool-role messages / tool_calls arrays, so strict providers do not 400). Always
+    inline as third-party actions ("the acting agent called tool"), tool results
+    folded into the preceding assistant turn as labeled third-party previews ("the
+    acting agent's tool result preview") — no tool-role messages / tool_calls arrays,
+    so strict providers do not 400. Always
     ends on a ``user`` turn (Anthropic treats a trailing assistant turn as prefill)
     by APPENDING a synthetic request. The aggregator always gets the full transcript.
     """
@@ -769,7 +804,7 @@ def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         elif role == "tool":
             # Fold the tool result into the preceding assistant turn as text (a leading
             # tool result with no assistant turn opens one).
-            block = f"[tool result: {_truncate_tool_result(text)}]"
+            block = f"[the acting agent's tool result preview: {_truncate_tool_result(text)}]"
             if rendered and rendered[-1].get("role") == "assistant":
                 rendered[-1]["content"] = rendered[-1]["content"] + "\n" + block
             else:
