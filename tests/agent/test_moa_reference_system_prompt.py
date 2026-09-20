@@ -5,7 +5,7 @@ against claiming tool execution.
 Related issue: #61452
 """
 
-from agent.moa_loop import _REFERENCE_SYSTEM_PROMPT
+from agent.moa_loop import _ADVISORY_INSTRUCTION, _REFERENCE_SYSTEM_PROMPT
 
 
 def test_reference_system_prompt_prohibits_claiming_execution():
@@ -71,3 +71,95 @@ def test_reference_system_prompt_structure():
     # Should contain the word "advisor" (defines role)
     assert "advisor" in _REFERENCE_SYSTEM_PROMPT.lower(), \
         "Prompt should clearly define the advisor role"
+
+
+def test_reference_system_prompt_anti_hallucination_clauses():
+    """
+    Verify the reference system prompt carries the strengthened clauses that
+    prevent tool-execution narration by a tool-less advisor.
+
+    Regression for the observed bug where the reference advisor (no tools)
+    fabricated tool-output narratives ("output was garbled", "came back
+    empty", "hit SSL errors", "returned 400") that only the acting agent
+    could have observed. The prompt must:
+    1. State the advisor has no tools and no tool results
+    2. Prohibit emitting output/log/error-shaped text
+    3. Require "unclear from the transcript" honesty instead of invention
+    4. Attribute every event to the acting agent in third person
+
+    Behavior-contract assertions only: substring checks, no full-text equality.
+    """
+    prompt = _REFERENCE_SYSTEM_PROMPT
+    prompt_lower = prompt.lower()
+
+    # No-tools framing: the advisor must never mistake transcript tool events
+    # for its own capabilities or observations.
+    assert "you have no tools and no tool results" in prompt_lower, \
+        "Prompt must state the advisor has no tools and no tool results"
+
+    # Prohibition on emitting tool/output/log/error-shaped text.
+    assert "never output any" in prompt_lower, \
+        "Prompt must prohibit emitting tool/output/log-shaped text"
+    assert "log lines, error strings, status messages" in prompt_lower, \
+        "Prompt must forbid log/error/status-shaped text"
+    assert "tool-call blocks" in prompt_lower, \
+        "Prompt must forbid tool-call blocks"
+
+    # Honesty clause: say so when the transcript does not establish a fact.
+    assert "unclear from the transcript" in prompt_lower, \
+        "Prompt must require explicit 'unclear from the transcript' honesty"
+
+    # Third-person attribution: events belong to the acting agent, and output
+    # must never be presented as the advisor's own observation.
+    assert "the acting agent's" in prompt, \
+        "Prompt must attribute transcript events to the acting agent"
+    assert "third person" in prompt_lower, \
+        "Prompt must require third-person attribution"
+
+    # Corrupted-looking tool results are the acting agent's report to advise
+    # on re-verification, never something to re-run ourselves.
+    assert "acting agent's report" in prompt_lower, \
+        "Prompt must treat tool results as the acting agent's report"
+    assert "re-verify" in prompt_lower, \
+        "Prompt must advise re-verification instead of re-running"
+
+
+def test_advisory_instruction_reminds_constraints_at_generation_point():
+    """
+    The trailing synthetic advisory instruction must restate the no-tools
+    constraints immediately before the reference model generates, not only at
+    the front of the system prompt.
+
+    Regression guard for the observed bug where the reference advisor (no
+    tools) fabricated tool-execution narratives despite the system-prompt
+    prohibitions: recency favors the transcript's tool-call blocks sitting
+    right before the output position, so the trailing instruction must repeat
+    the constraints at that spot.
+
+    Behavior-contract assertions only: substring checks, no full-text equality.
+    """
+    # Original judgement request preserved verbatim in semantics.
+    assert "most intelligent judgement" in _ADVISORY_INSTRUCTION
+
+    # Reminder point 1: the advisor has no tools and no tool results.
+    assert "NO tools and NO tool results" in _ADVISORY_INSTRUCTION, \
+        "Advisory instruction must restate that the advisor has no tools"
+
+    # Reminder point 2: never emit tool-call blocks / output-shaped text.
+    assert "Never emit tool-call" in _ADVISORY_INSTRUCTION, \
+        "Advisory instruction must forbid tool-call blocks"
+
+    # Reminder point 3: third-person attribution to the acting agent.
+    assert "third person" in _ADVISORY_INSTRUCTION, \
+        "Advisory instruction must require third-person attribution"
+    assert "the acting agent reported" in _ADVISORY_INSTRUCTION, \
+        "Advisory instruction must show the third-person attribution shape"
+
+    # Reminder point 4: honesty when the transcript does not establish a fact.
+    assert "unclear from the transcript" in _ADVISORY_INSTRUCTION, \
+        "Advisory instruction must require 'unclear from the transcript' honesty"
+
+    # Reminder point 5: plain advisory prose only.
+    assert "plain advisory prose" in _ADVISORY_INSTRUCTION, \
+        "Advisory instruction must require plain advisory prose"
+

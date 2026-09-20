@@ -446,10 +446,11 @@ def test_reference_messages_drops_system_but_renders_tools_as_text():
     assert all("tool_calls" not in m for m in view)
     # System prompt is gone.
     assert all("huge hermes system prompt" not in m["content"] for m in view)
-    # The agent's action and the tool result are PRESERVED as text.
+    # The agent's action and the tool result are PRESERVED as text, attributed
+    # to the acting agent in third person.
     joined = "\n".join(m["content"] for m in view)
-    assert "[called tool: f(" in joined
-    assert "[tool result: tool result]" in joined
+    assert "[the acting agent called tool: f(" in joined
+    assert "[the acting agent's tool result preview: tool result]" in joined
     assert "here is my answer" in joined
     # Ends on a user turn (advisory request appended after the final assistant).
     assert view[-1]["role"] == "user"
@@ -484,18 +485,99 @@ def test_reference_messages_ends_with_user_not_assistant_prefill():
     assert view, "advisory view should not be empty"
     assert view[-1]["role"] == "user"
     joined = "\n".join(m["content"] for m in view)
-    # The agent's latest action and its result are preserved, not dropped.
+    # The agent's latest action and its result are preserved, not dropped,
+    # attributed to the acting agent in third person.
     assert "let me reason then call a tool" in joined
-    assert "[called tool: f(" in joined
-    assert "[tool result: the tool output]" in joined
+    assert "[the acting agent called tool: f(" in joined
+    assert "[the acting agent's tool result preview: the tool output]" in joined
     # Earlier context preserved too.
     assert "q1" in joined and "a1" in joined and "q2 current" in joined
 
 
+def test_reference_messages_trailing_advisory_instruction_is_reminder():
+    """The synthetic trailing user turn carries the full constraint reminder.
+
+    The no-tools hallucination fix relies on the reminder sitting at the
+    generation point: the advisory view's LAST message must be the synthetic
+    advisory instruction (equality against the module constant — the same
+    equality the fanout cache-key marker uses) and that text must restate the
+    no-tools constraints.
+    """
+    from agent.moa_loop import _ADVISORY_INSTRUCTION, _reference_messages
+
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2 current"},
+        {
+            "role": "assistant",
+            "content": "let me reason then call a tool",
+            "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "the tool output"},
+    ]
+
+    view = _reference_messages(messages)
+
+    assert view[-1]["role"] == "user"
+    assert view[-1]["content"] == _ADVISORY_INSTRUCTION
+    # The reminder clauses are present at the generation point.
+    assert "most intelligent judgement" in view[-1]["content"]
+    assert "NO tools and NO tool results" in view[-1]["content"]
+    assert "Never emit tool-call" in view[-1]["content"]
+    assert "third person" in view[-1]["content"]
+    assert "unclear from the transcript" in view[-1]["content"]
+    assert "plain advisory prose" in view[-1]["content"]
+    # The transcript content is still visible for the advisor to judge.
+    assert "[the acting agent called tool: f(" in "\n".join(m["content"] for m in view)
 
 
+def test_fanout_cache_key_excludes_synthetic_advisory_turn():
+    """The 'user_turn' fanout cache key treats the advisory instruction as a
+    marker, not as content.
 
+    The synthetic advisory turn is appended on EVERY advisory view, so if it
+    counted as a real user message the hashed prefix would include it — and
+    since the reminder text is constant, that alone would not break caching.
+    The contract that matters: the key for a view WITH the trailing advisory
+    turn is byte-identical to the key for the same view WITHOUT it (excluded
+    by content equality against the module constant), so mid-turn growth never
+    re-signs the cache.
+    """
+    from agent.moa_loop import MoAChatCompletions, _ADVISORY_INSTRUCTION, _reference_messages
 
+    client = MoAChatCompletions("review")
+    preset = {"fanout": "user_turn"}
+    reference_models = [{"provider": "x", "model": "y"}]
+
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2 current"},
+        {
+            "role": "assistant",
+            "content": "let me reason then call a tool",
+            "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "the tool output"},
+    ]
+
+    ref_messages = _reference_messages(messages)
+    assert ref_messages[-1]["content"] == _ADVISORY_INSTRUCTION
+
+    with_advisory = client._fanout_cache_key(preset, ref_messages, reference_models)
+    without_advisory = client._fanout_cache_key(preset, ref_messages[:-1], reference_models)
+    assert with_advisory == without_advisory, \
+        "The trailing advisory turn must be excluded from the 'user_turn' cache key"
+
+    # Sanity: the key is not trivially constant — it still distinguishes real
+    # user content, so the equality above proves the marker exclusion, not a
+    # broken hash.
+    other_view = [
+        {"role": "user", "content": "different real turn"},
+        {"role": "user", "content": _ADVISORY_INSTRUCTION},
+    ]
+    assert client._fanout_cache_key(preset, other_view, reference_models) != with_advisory
 
 
 def test_run_reference_prepends_advisory_system_prompt(monkeypatch):
@@ -1318,7 +1400,7 @@ def test_reference_trim_caches_resolution_failures(monkeypatch):
 
 def test_render_tool_calls_tolerates_namespace_shapes():
     """SDK-shaped (SimpleNamespace) tool_call entries must render their real
-    function name+args, not degrade to '[called tool: tool]'."""
+    function name+args, not degrade to '[the acting agent called tool: tool]'."""
     from agent.moa_loop import _render_tool_calls
 
     ns_call = SimpleNamespace(
@@ -1327,12 +1409,44 @@ def test_render_tool_calls_tolerates_namespace_shapes():
     dict_call = {"function": {"name": "read_file", "arguments": '{"path": "y"}'}}
     mixed = _render_tool_calls([ns_call, dict_call])
 
-    assert '[called tool: web_search({"query": "x"})]' in mixed
-    assert '[called tool: read_file({"path": "y"})]' in mixed
+    assert '[the acting agent called tool: web_search({"query": "x"})]' in mixed
+    assert '[the acting agent called tool: read_file({"path": "y"})]' in mixed
 
     # Dict entry with a namespace-shaped nested function also renders.
     hybrid = {"function": SimpleNamespace(name="terminal", arguments=None)}
-    assert _render_tool_calls([hybrid]) == "[called tool: terminal]"
+    assert _render_tool_calls([hybrid]) == "[the acting agent called tool: terminal]"
 
     # Degenerate shapes still fall back safely.
-    assert _render_tool_calls([SimpleNamespace()]) == "[called tool: tool]"
+    assert _render_tool_calls([SimpleNamespace()]) == "[the acting agent called tool: tool]"
+
+
+def test_reference_messages_third_party_attribution_no_legacy_markers():
+    """The advisory view attributes every tool call/result to the acting agent.
+
+    Regression for the advisor-hallucination bug class: an advisor with no tools
+    pattern-matched raw first-person tool/output-shaped transcript lines and
+    fabricated tool-execution narratives. Every rendered call line must say "the
+    acting agent called tool" and every folded result preview must say "the
+    acting agent's tool result preview" — and no legacy first-person
+    "[called tool:" / "[tool result:" markers may survive anywhere in the view.
+    """
+    from agent.moa_loop import _reference_messages
+
+    messages = [
+        {"role": "user", "content": "check the endpoint"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "function": {"name": "terminal", "arguments": '{"cmd": "curl -sI https://pf-merchant"}'}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "HTTP/1.1 400 Bad Request"},
+    ]
+
+    view = _reference_messages(messages)
+    joined = "\n".join(m["content"] for m in view)
+
+    assert "[the acting agent called tool: terminal(" in joined
+    assert "[the acting agent's tool result preview: HTTP/1.1 400 Bad Request]" in joined
+    # No legacy first-person markers anywhere in the advisory view.
+    assert "[called tool:" not in joined
+    assert "[tool result:" not in joined
