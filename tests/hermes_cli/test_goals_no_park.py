@@ -22,6 +22,7 @@ Covers the full validation matrix from the task spec:
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -54,10 +55,19 @@ def hermes_home(tmp_path, monkeypatch):
 # Shared helpers
 # ──────────────────────────────────────────────────────────────────────
 
-# A judge verdict that, in park-enabled mode, sets a pid wait barrier.
-WAIT_RESPONSE = (
-    '{"verdict": "wait", "reason": "waiting on build", "wait_on_pid": 4242}'
-)
+def _wait_response_for_pid(pid: int) -> str:
+    """A judge verdict that, in park-enabled mode, sets a pid wait barrier.
+
+    The pid must be one the host can observe as alive: since #110826 a
+    wait_on_pid that is not alive on this host is a barrier that can never
+    lift, so the judge path downgrades WAIT to CONTINUE instead of parking.
+    ``os.getpid()`` (the pytest process itself) is always alive.
+    """
+    return f'{{"verdict": "wait", "reason": "waiting on build", "wait_on_pid": {pid}}}'
+
+
+# Default scripted verdict: park on the live test process itself.
+WAIT_RESPONSE = _wait_response_for_pid(os.getpid())
 
 
 def _system_prompt_from(captured: dict) -> str:
@@ -203,11 +213,12 @@ class TestGoalNoParkE2E:
         assert "Picking WAIT parks the loop" in system_msg
         assert decision["verdict"] == "wait"
         assert decision["should_continue"] is False
-        # The judge-WAIT branch parks the loop on pid 4242. Note: whether a
-        # LATER is_waiting() call still reports the barrier depends on whether
-        # pid 4242 is alive in this environment (is_waiting self-clears when
-        # the pid is gone), so we assert the barrier WAS set, not its liveness.
-        assert harness.mgr.state.waiting_on_pid == 4242
+        # The judge-WAIT branch parks the loop on the pid the scripted verdict
+        # named (the live test process). Note: whether a LATER is_waiting()
+        # call still reports the barrier depends on the pid staying alive
+        # (is_waiting self-clears when the pid is gone), so we assert the
+        # barrier WAS set, not its liveness.
+        assert harness.mgr.state.waiting_on_pid == os.getpid()
 
     def test_no_prefix_is_backward_compatible_false(self, hermes_home):
         """Scenario (3): /goal without a prefix behaves exactly as today."""
@@ -290,4 +301,4 @@ class TestGoalNoParkE2E:
         system_msg = _system_prompt_from(captured)
         assert "Picking WAIT parks the loop" in system_msg
         assert decision["verdict"] == "wait"
-        assert mgr.state.waiting_on_pid == 4242
+        assert mgr.state.waiting_on_pid == os.getpid()

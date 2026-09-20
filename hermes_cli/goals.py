@@ -2350,7 +2350,6 @@ __all__ = [
     "parse_contract",
     "draft_contract",
     "run_gate",
-    "workspace_fingerprint",
     "CONTINUATION_PROMPT_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE",

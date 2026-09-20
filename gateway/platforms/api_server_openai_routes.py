@@ -757,14 +757,18 @@ class OpenAICompatRoutesMixin:
         response_data = {
             "id": completion_id, "object": "chat.completion", "created": created,
             "model": model_name,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "" if presentation_muted else final_response,
-                         "content_parts": [{"type": "output_text", "text": final_response}] + media_blocks},
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "" if presentation_muted else final_response},
                          "finish_reason": finish_reason}],
             "usage": _chat_usage_payload(usage)}
         # Non-streaming twin of ``delta.reasoning_content`` (#99552).
         reasoning_text = _turn_reasoning_text(history, user_message, result)
         if reasoning_text and not presentation_muted:
             response_data["choices"][0]["message"]["reasoning_content"] = reasoning_text
+        if not presentation_muted:
+            # Multimodal extras ride the same post-processing the other extras use, so a
+            # notification-internal turn (presentation suppressed) leaks neither text nor media.
+            response_data["choices"][0]["message"]["content_parts"] = (
+                [{"type": "output_text", "text": final_response}] + media_blocks)
         if is_partial or is_failed or not completed:
             response_data["hermes"] = _hermes_extras(
                 completed, is_partial, is_failed, "" if presentation_muted else err_msg, finish_reason)
