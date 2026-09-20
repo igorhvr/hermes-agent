@@ -110,17 +110,171 @@ CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
     "gate itself is wrong or cannot pass, say so clearly and stop."
 )
 
-JUDGE_SYSTEM_PROMPT = (
+# No-ask variants of the continuation prompts above. When a goal is set with
+# `dont-ask-user-input: #t` the agent is expected to run fully unattended —
+# it must never stop to hand off to the user. The default templates tell the
+# agent "if you are blocked and need input from the user, say so clearly and
+# stop", which makes the model halt at decision points instead of pushing
+# forward. These variants replace that sentence with autonomous-progress
+# guidance so the agent keeps working until the goal is genuinely done or the
+# budget is exhausted. They are deliberately private: callers select them
+# through `_build_continuation_prompt`, never directly, so the flag-False
+# output stays byte-identical to the public templates above.
+_CONTINUATION_PROMPT_NO_ASK_TEMPLATE = (
+    "[Continuing toward your standing goal]\n"
+    "Goal: {goal}\n\n"
+    "Continue working toward this goal. Take the next concrete step. "
+    "If you believe the goal is complete, state so explicitly and stop. "
+    "If you are blocked, work around it, use your best judgment, and keep going."
+)
+
+_CONTINUATION_PROMPT_WITH_CONTRACT_NO_ASK_TEMPLATE = (
+    "[Continuing toward your standing goal]\n"
+    "Goal: {goal}\n\n"
+    "Completion contract:\n"
+    "{contract_block}\n\n"
+    "Continue working toward the outcome above. Take the next concrete step. "
+    "Stay within the stated boundaries and do not violate the constraints. "
+    "Before claiming the goal is done, satisfy the Verification criterion and "
+    "show the concrete evidence (command output, file contents, test result). "
+    "If you hit the stated stop condition or are otherwise blocked, work "
+    "around it, use your best judgment, and keep going."
+)
+
+_CONTINUATION_PROMPT_WITH_SUBGOALS_NO_ASK_TEMPLATE = (
+    "[Continuing toward your standing goal]\n"
+    "Goal: {goal}\n\n"
+    "Additional criteria the user added mid-loop:\n"
+    "{subgoals_block}\n\n"
+    "Continue working toward the goal AND all additional criteria. Take "
+    "the next concrete step. If you believe the goal and every "
+    "additional criterion are complete, state so explicitly and stop. "
+    "If you are blocked, work around it, use your best judgment, and "
+    "keep going."
+)
+
+
+def _build_continuation_prompt(
+    goal: str,
+    *,
+    contract_block: Optional[str] = None,
+    subgoals_block: Optional[str] = None,
+    dont_ask_user_input: bool = False,
+) -> str:
+    """Build the continuation prompt sent back to an agent pursuing a goal.
+
+    ``goal`` is the objective text. ``contract_block`` and ``subgoals_block``
+    select the variant — contract takes priority over subgoals (mirroring
+    ``GoalManager.next_continuation_prompt``, which folds subgoals into the
+    contract block). With both ``None`` the plain template is used.
+
+    When ``dont_ask_user_input=True`` the no-ask variants are used: the final
+    "if you are blocked ... say so clearly and stop" sentence is replaced with
+    autonomous guidance ("work around it, use your best judgment, and keep
+    going") so a goal set with `dont-ask-user-input: #t` never stops to hand
+    off to the user. When False (the default) the output is byte-identical to
+    ``CONTINUATION_PROMPT_TEMPLATE`` / ``CONTINUATION_PROMPT_WITH_CONTRACT_``
+    ``TEMPLATE`` / ``CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE``.
+    """
+    if dont_ask_user_input:
+        if contract_block is not None:
+            return _CONTINUATION_PROMPT_WITH_CONTRACT_NO_ASK_TEMPLATE.format(
+                goal=goal, contract_block=contract_block
+            )
+        if subgoals_block is not None:
+            return _CONTINUATION_PROMPT_WITH_SUBGOALS_NO_ASK_TEMPLATE.format(
+                goal=goal, subgoals_block=subgoals_block
+            )
+        return _CONTINUATION_PROMPT_NO_ASK_TEMPLATE.format(goal=goal)
+    if contract_block is not None:
+        return CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(
+            goal=goal, contract_block=contract_block
+        )
+    if subgoals_block is not None:
+        return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
+            goal=goal, subgoals_block=subgoals_block
+        )
+    return CONTINUATION_PROMPT_TEMPLATE.format(goal=goal)
+
+
+# The goal judge can return a WAIT verdict that parks the loop — the loop
+# stops burning turns and pauses until a background process exits, a session
+# trigger fires, or a timer elapses. A user can disable this per-goal with
+# `no-park: #t` on /goal. For such goals the system prompt is built WITHOUT
+# the WAIT paragraph (and without the wait JSON shapes or the four-verdicts
+# wording) so the judge never emits a verdict the caller would
+# have to downgrade. The prompt is therefore composed from the sections
+# below; JUDGE_SYSTEM_PROMPT stays BASE + WAIT for backward compatibility.
+
+# Preambles — the WAIT/no-park variants differ only in how many verdicts the
+# judge is told to decide between.
+_JUDGE_SYSTEM_PROMPT_PREAMBLE = (
     "You are a strict judge evaluating whether an autonomous agent has "
     "achieved a user's stated goal. You receive the goal text, the agent's "
     "most recent response, and — when present — a list of background "
     "processes the agent has running. Decide one of four verdicts.\n\n"
+)
+
+_JUDGE_SYSTEM_PROMPT_PREAMBLE_NO_WAIT = (
+    "You are a strict judge evaluating whether an autonomous agent has "
+    "achieved a user's stated goal. You receive the goal text, the agent's "
+    "most recent response, and — when present — a list of background "
+    "processes the agent has running. Decide one of three verdicts.\n\n"
+)
+
+# No-ask preambles. With `dont-ask-user-input: #t` the goal runs unattended
+# and BLOCKED is not offered (there is no user to hand off to), so the
+# no-ask variants drop one more verdict: three (DONE/WAIT/CONTINUE) when
+# parking is allowed, two (DONE/CONTINUE) when no-park is also set.
+_JUDGE_SYSTEM_PROMPT_PREAMBLE_NO_ASK = (
+    "You are a strict judge evaluating whether an autonomous agent has "
+    "achieved a user's stated goal. You receive the goal text, the agent's "
+    "most recent response, and — when present — a list of background "
+    "processes the agent has running. Decide one of three verdicts.\n\n"
+)
+
+_JUDGE_SYSTEM_PROMPT_PREAMBLE_NO_ASK_NO_WAIT = (
+    "You are a strict judge evaluating whether an autonomous agent has "
+    "achieved a user's stated goal. You receive the goal text, the agent's "
+    "most recent response, and — when present — a list of background "
+    "processes the agent has running. Decide one of two verdicts.\n\n"
+)
+
+# The "DONE — the goal is fully satisfied" paragraph is split from the
+# BLOCKED verdict paragraph so a single builder can assemble the
+# `dont-ask-user-input` variant that omits BLOCKED without duplicating any
+# DONE wording. The public constant JUDGE_SYSTEM_PROMPT_DONE stays
+# byte-identical to the original genuine-completion paragraph.
+_JUDGE_SYSTEM_PROMPT_DONE_GENUINE = (
     "DONE — the goal is fully satisfied:\n"
     "- The response explicitly confirms the goal was completed, OR\n"
     "- The response clearly shows the final deliverable was produced.\n"
     "DONE requires the deliverable to actually exist. If the response only "
     "explains why the goal cannot be reached, the verdict is BLOCKED, not "
     "DONE.\n\n"
+)
+
+# DONE is exactly the genuine-completion paragraph above: in the current
+# prompt the blocked / user-input hand-off is a verdict of its own (BLOCKED),
+# not a DONE reason, so there is no hand-off clause to append.
+JUDGE_SYSTEM_PROMPT_DONE = _JUDGE_SYSTEM_PROMPT_DONE_GENUINE
+
+# When a goal is set with `dont-ask-user-input: #t` the agent runs fully
+# unattended and has no user to hand off to. The no-ask build omits the
+# BLOCKED verdict entirely, so this DONE paragraph drops the "verdict is
+# BLOCKED, not DONE" pointer and instead states plainly that a block is NOT
+# a stop condition — the agent must keep working.
+_JUDGE_SYSTEM_PROMPT_DONE_NO_ASK = (
+    "DONE — the goal is fully satisfied:\n"
+    "- The response explicitly confirms the goal was completed, OR\n"
+    "- The response clearly shows the final deliverable was produced.\n"
+    "DONE requires the deliverable to actually exist. If the response only "
+    "reports the work is blocked or could not make progress, that is NOT "
+    "DONE: the goal runs unattended, so the agent must keep working and "
+    "continue.\n\n"
+)
+
+JUDGE_SYSTEM_PROMPT_BLOCKED = (
     "BLOCKED — the goal cannot be satisfied as stated:\n"
     "- The response explains the goal is genuinely unachievable (impossible, "
     "out of scope, no valid path to the deliverable), or refuses to "
@@ -136,6 +290,9 @@ JUDGE_SYSTEM_PROMPT = (
     "itself names. Never infer one the response does not name — an unnamed "
     "401 belongs to the model provider the agent was calling, not to some "
     "other service's token.\n\n"
+)
+
+JUDGE_SYSTEM_PROMPT_WAIT = (
     "WAIT — the goal is NOT done, but the next step is to wait for async "
     "work to finish rather than act again. Choose this ONLY when the agent's "
     "progress is genuinely gated on something running on its own:\n"
@@ -157,9 +314,17 @@ JUDGE_SYSTEM_PROMPT = (
     "automatically when the pid exits or the time elapses. Do NOT pick WAIT "
     "just because work remains — only when re-poking now would be pure "
     "busy-work because the agent can't progress until the async thing "
-    "finishes.\n\n"
+    "finishes."
+)
+
+JUDGE_SYSTEM_PROMPT_CONTINUE = (
     "CONTINUE — not done, and there is a concrete next step the agent can "
     "take right now. This is the default when in doubt.\n\n"
+)
+
+# Reply-shapes sections. The WAIT variant instructs the model on the wait_*
+# JSON shapes; the no-park variant omits them entirely.
+_JUDGE_SYSTEM_PROMPT_REPLY = (
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
     '{"verdict": "done", "reason": "<one sentence>"}\n'
     '{"verdict": "blocked", "reason": "<one sentence>"}\n'
@@ -171,11 +336,115 @@ JUDGE_SYSTEM_PROMPT = (
     "accepted (true=done, false=continue)."
 )
 
+_JUDGE_SYSTEM_PROMPT_REPLY_NO_WAIT = (
+    "Reply ONLY with a single JSON object on one line. Shapes:\n"
+    '{"verdict": "done", "reason": "<one sentence>"}\n'
+    '{"verdict": "blocked", "reason": "<one sentence>"}\n'
+    '{"verdict": "continue", "reason": "<one sentence>"}\n'
+    "The legacy shape {\"done\": <true|false>, \"reason\": \"...\"} is still "
+    "accepted (true=done, false=continue)."
+)
+
+# No-ask reply shapes (BLOCKED is not offered for unattended goals).
+_JUDGE_SYSTEM_PROMPT_REPLY_NO_ASK = (
+    "Reply ONLY with a single JSON object on one line. Shapes:\n"
+    '{"verdict": "done", "reason": "<one sentence>"}\n'
+    '{"verdict": "continue", "reason": "<one sentence>"}\n'
+    '{"verdict": "wait", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
+    '{"verdict": "wait", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
+    '{"verdict": "wait", "wait_for_seconds": <int>, "reason": "<one sentence>"}\n'
+    "The legacy shape {\"done\": <true|false>, \"reason\": \"...\"} is still "
+    "accepted (true=done, false=continue)."
+)
+
+_JUDGE_SYSTEM_PROMPT_REPLY_NO_ASK_NO_WAIT = (
+    "Reply ONLY with a single JSON object on one line. Shapes:\n"
+    '{"verdict": "done", "reason": "<one sentence>"}\n'
+    '{"verdict": "continue", "reason": "<one sentence>"}\n'
+    "The legacy shape {\"done\": <true|false>, \"reason\": \"...\"} is still "
+    "accepted (true=done, false=continue)."
+)
+
+# Everything except the WAIT paragraph. The WAIT paragraph itself is a
+# self-contained block appended at the end so JUDGE_SYSTEM_PROMPT can be
+# expressed as BASE + WAIT (and so a no-park build simply omits WAIT).
+JUDGE_SYSTEM_PROMPT_BASE = (
+    _JUDGE_SYSTEM_PROMPT_PREAMBLE
+    + JUDGE_SYSTEM_PROMPT_DONE
+    + JUDGE_SYSTEM_PROMPT_BLOCKED
+    + JUDGE_SYSTEM_PROMPT_CONTINUE
+    + _JUDGE_SYSTEM_PROMPT_REPLY
+    + "\n\n"
+)
+
+# Backward-compatible default: the full judge prompt including the WAIT
+# verdict. Every existing caller that references JUDGE_SYSTEM_PROMPT keeps
+# identical behavior.
+JUDGE_SYSTEM_PROMPT = JUDGE_SYSTEM_PROMPT_BASE + JUDGE_SYSTEM_PROMPT_WAIT
+
 # Judge prompt line for live delegated subagents (WAIT-for-seconds vs CONTINUE).
 JUDGE_DELEGATIONS_BLOCK_TEMPLATE = (
     "Active delegations: the agent has {count} delegated subagent batch(es) still running; "
     "their results are delivered to it automatically when they finish.\n\n"
 )
+
+
+def _build_judge_system_prompt(
+    no_park: bool = False, dont_ask_user_input: bool = False
+) -> str:
+    """Return the goal-judge system prompt.
+
+    With ``no_park=False`` (the default) this is exactly
+    ``JUDGE_SYSTEM_PROMPT``: the judge may emit a ``wait`` verdict that parks
+    the loop. With ``no_park=True`` the WAIT verdict is removed entirely —
+    the preamble wording drops to three verdicts, the WAIT paragraph is
+    omitted, and the reply shapes no longer include the ``wait_on_*`` forms,
+    so the judge is never told a verdict exists that the caller would
+    downgrade. DONE, BLOCKED and CONTINUE are described fully in both
+    variants.
+
+    ``dont_ask_user_input`` (default False) drops the BLOCKED verdict (and
+    the blocked / user-input hand-off) from the build: when a goal runs
+    unattended there is no user to hand off to, so a merely "blocked"
+    response is a CONTINUE signal, never a DONE reason. It composes with
+    ``no_park`` — one builder assembles every combination — and when False
+    (with either ``no_park`` value) the output is byte-identical to
+    today's builds.
+    """
+    done_section = (
+        _JUDGE_SYSTEM_PROMPT_DONE_NO_ASK
+        if dont_ask_user_input
+        else JUDGE_SYSTEM_PROMPT_DONE
+    )
+    if dont_ask_user_input:
+        # Unattended goal: no user to hand off to, so BLOCKED is not offered
+        # — a merely blocked response is a CONTINUE signal, and the judge
+        # decides between DONE (genuine completion only), WAIT (when parking
+        # is allowed) and CONTINUE.
+        return (
+            (
+                _JUDGE_SYSTEM_PROMPT_PREAMBLE_NO_ASK_NO_WAIT
+                if no_park
+                else _JUDGE_SYSTEM_PROMPT_PREAMBLE_NO_ASK
+            )
+            + done_section
+            + (JUDGE_SYSTEM_PROMPT_WAIT if not no_park else "")
+            + JUDGE_SYSTEM_PROMPT_CONTINUE
+            + (
+                _JUDGE_SYSTEM_PROMPT_REPLY_NO_ASK_NO_WAIT
+                if no_park
+                else _JUDGE_SYSTEM_PROMPT_REPLY_NO_ASK
+            )
+        )
+    if no_park:
+        return (
+            _JUDGE_SYSTEM_PROMPT_PREAMBLE_NO_WAIT
+            + done_section
+            + JUDGE_SYSTEM_PROMPT_BLOCKED
+            + JUDGE_SYSTEM_PROMPT_CONTINUE
+            + _JUDGE_SYSTEM_PROMPT_REPLY_NO_WAIT
+        )
+    return JUDGE_SYSTEM_PROMPT
 
 # Judge prompt block listing running background processes (WAIT vs CONTINUE, which pid).
 JUDGE_BACKGROUND_BLOCK_TEMPLATE = (
@@ -236,6 +505,100 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
 )
 
 # /goal draft: turn a plain objective into a reviewable contract (after Codex's "draft the goal").
+
+
+# No-ask variant of the contract judge template above. When a goal is set
+# with `dont-ask-user-input: #t` the agent runs fully unattended and never
+# hands off to the user, so the "blocked / unachievable / needs user input →
+# DONE" decision rule must flip: a block is a CONTINUE signal, not a DONE
+# reason. This template keeps every other decision rule identical and only
+# rewrites that one bullet. Deliberately private — callers route through
+# `_build_judge_user_prompt`, never directly, so the flag-False output stays
+# byte-identical to `JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE`.
+_JUDGE_USER_PROMPT_WITH_CONTRACT_NO_ASK_TEMPLATE = (
+    "Goal:\n{goal}\n\n"
+    "Completion contract (the authoritative definition of done):\n"
+    "{contract_block}\n\n"
+    "Agent's most recent response:\n{response}\n\n"
+    "{background_block}"
+    "Current time: {current_time}\n\n"
+    "Decision rules:\n"
+    "- The goal is DONE only when the Verification criterion is satisfied AND "
+    "the response shows concrete evidence of it (a command result, file "
+    "contents excerpt, test/benchmark output) — not a claim like 'done' or "
+    "'all tests pass' without evidence.\n"
+    "- If any stated Constraint was violated, the goal is NOT done — CONTINUE.\n"
+    "- If the response shows the agent is waiting on a listed background "
+    "process to satisfy the Verification criterion (e.g. CI is the "
+    "verification and it's still running), return WAIT on that process "
+    "instead of re-poking — re-poking now would be pure busy-work.\n"
+    "- If the response reports the work is blocked / unachievable / the "
+    "stated Stop condition was hit, treat it as CONTINUE: the goal runs "
+    "unattended, so the agent must keep working and take the next concrete "
+    "step rather than stop.\n"
+    "- Otherwise the goal is NOT done — CONTINUE.\n\n"
+    "Is the goal satisfied per its completion contract — done, continue, or wait?"
+)
+
+
+def _build_judge_user_prompt(
+    goal: str,
+    response: str,
+    background_block: str,
+    current_time: str,
+    *,
+    contract_block: Optional[str] = None,
+    subgoals_block: Optional[str] = None,
+    dont_ask_user_input: bool = False,
+) -> str:
+    """Build the goal-judge user prompt (contract > subgoals > plain).
+
+    Mirrors the exact selection priority and truncation rules ``judge_goal``
+    uses: a contract block wins over a subgoals block, and plain is the
+    fallback when neither is provided.
+
+    When ``dont_ask_user_input=True`` the contract template is swapped for
+    its no-ask variant, whose decision rules treat a merely "blocked"
+    response as CONTINUE rather than DONE — the goal runs unattended, so the
+    agent must keep working instead of hand-waving a stop. The plain and
+    subgoals templates carry no user-input hand-off phrasing and are used
+    unchanged in both flag states. When False (the default) the output is
+    byte-identical to ``JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE`` /
+    ``JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE`` /
+    ``JUDGE_USER_PROMPT_TEMPLATE``.
+    """
+    if contract_block is not None:
+        template = (
+            _JUDGE_USER_PROMPT_WITH_CONTRACT_NO_ASK_TEMPLATE
+            if dont_ask_user_input
+            else JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE
+        )
+        return template.format(
+            goal=_truncate(goal, 2000),
+            contract_block=_truncate(contract_block, 2500),
+            response=_truncate(response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+            background_block=background_block,
+            current_time=current_time,
+        )
+    if subgoals_block is not None:
+        return JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
+            goal=_truncate(goal, 2000),
+            subgoals_block=_truncate(subgoals_block, 2000),
+            response=_truncate(response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+            background_block=background_block,
+            current_time=current_time,
+        )
+    return JUDGE_USER_PROMPT_TEMPLATE.format(
+        goal=_truncate(goal, 2000),
+        response=_truncate(response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+        background_block=background_block,
+        current_time=current_time,
+    )
+
+
+# System prompt for /goal draft — turns a plain-language objective into a
+# structured completion contract the user can review before activating.
+# Adapted from Codex's "let Codex draft the goal" guidance.
 DRAFT_CONTRACT_SYSTEM_PROMPT = (
     "You turn a user's plain-language objective into a structured completion "
     "contract for an autonomous coding agent. The contract has five fields:\n"
@@ -307,6 +670,122 @@ class GoalContract:
     def render_block(self) -> str:
         """Non-empty fields as a labelled block; empty contract → empty string."""
         return "\n".join(f"- {_CONTRACT_LABELS[f]}: {getattr(self, f).strip()}" for f in _CONTRACT_FIELDS if getattr(self, f).strip())
+
+
+# Leading SRFI-88-style ``no-park:`` / ``dont-ask-user-input:`` tokens accepted
+# at the start of a /goal argument (case-insensitive identifier). A single token
+# after the colon is the value; anything after it is the goal text the token was
+# prepended to.
+_NO_PARK_PREFIX_RE = re.compile(r"^no-park\s*:\s*(.*)$", re.IGNORECASE)
+_DONT_ASK_USER_INPUT_PREFIX_RE = re.compile(
+    r"^dont-ask-user-input\s*:\s*(.*)$", re.IGNORECASE
+)
+
+
+def _parse_srfi88_value(key: str, value: str) -> bool:
+    """Validate an SRFI-88-style boolean token for a per-goal flag.
+
+    Accepts exactly ``#t`` → ``True`` and ``#f`` → ``False``. Any other
+    value (including an empty token) raises ``ValueError`` naming the flag
+    ``key`` and the offending ``value``. Shared by every per-goal SRFI-88
+    flag (``no-park``, ``dont-ask-user-input``) so the flags cannot drift in
+    accepted syntax or error text.
+    """
+    if value == "#t":
+        return True
+    if value == "#f":
+        return False
+    raise ValueError(f"Invalid value for {key}: must be #t or #f, got '{value}'")
+
+
+def parse_no_park_prefix(arg: str) -> Tuple[bool, str]:
+    """Parse an optional leading ``no-park:`` token from a /goal argument.
+
+    SRFI-88-style syntax: ``no-park: #t <goal text>`` enables the per-goal
+    WAIT-park override (``no_park=True``), ``no-park: #f <goal text>`` keeps
+    the default behavior (``no_park=False``). Any other value raises
+    ``ValueError`` with a message naming the offending token. When the token
+    is absent the argument is returned unchanged with ``no_park=False`` (the
+    default) — the caller should treat that exactly like today.
+
+    The returned remainder has the ``no-park:`` token (and its value) stripped
+    so it can be fed straight to ``parse_contract`` without polluting the
+    goal headline or contract.
+    """
+    stripped = arg.lstrip()
+    match = _NO_PARK_PREFIX_RE.match(stripped) if stripped else None
+    if not match:
+        return False, arg
+    tokens = match.group(1).split(None, 1)
+    value = tokens[0] if tokens else ""
+    remainder = tokens[1].strip() if len(tokens) > 1 else ""
+    return _parse_srfi88_value("no-park", value), remainder
+
+
+def parse_dont_ask_user_input_prefix(arg: str) -> Tuple[bool, str]:
+    """Parse an optional leading ``dont-ask-user-input:`` token from a /goal argument.
+
+    SRFI-88-style syntax: ``dont-ask-user-input: #t <goal text>`` marks the
+    goal as fully unattended (``dont_ask_user_input=True`` — the continuation
+    and judge prompts never ask the user for input), ``dont-ask-user-input: #f
+    <goal text>`` keeps the default behavior (``dont_ask_user_input=False``).
+    Any other value raises ``ValueError`` naming the offending token. When the
+    token is absent the argument is returned unchanged with ``False`` (the
+    default) — the caller should treat that exactly like today.
+
+    The returned remainder has the ``dont-ask-user-input:`` token (and its
+    value) stripped so it can be fed straight to ``parse_contract`` without
+    polluting the goal headline or contract.
+    """
+    stripped = arg.lstrip()
+    match = _DONT_ASK_USER_INPUT_PREFIX_RE.match(stripped) if stripped else None
+    if not match:
+        return False, arg
+    tokens = match.group(1).split(None, 1)
+    value = tokens[0] if tokens else ""
+    remainder = tokens[1].strip() if len(tokens) > 1 else ""
+    return _parse_srfi88_value("dont-ask-user-input", value), remainder
+
+
+def parse_goal_flags(arg: str) -> Tuple[bool, bool, str]:
+    """Parse the optional leading SRFI-88-style per-goal flag tokens.
+
+    Repeatedly strips leading ``no-park:`` and ``dont-ask-user-input:``
+    tokens (in ANY order, each possibly repeated — last one wins) from the
+    start of a /goal argument and returns ``(no_park, dont_ask_user_input,
+    remainder)``. Value validation is delegated to the per-key parsers
+    (:func:`parse_no_park_prefix` / :func:`parse_dont_ask_user_input_prefix`),
+    which share :func:`_parse_srfi88_value` — so an invalid value raises the
+    exact same ``ValueError`` as the single-prefix parsers, surfaced
+    left-to-right.
+
+    Examples::
+
+        parse_goal_flags("no-park: #t dont-ask-user-input: #t ship it")
+        # -> (True, True, "ship it")
+        parse_goal_flags("dont-ask-user-input: #t no-park: #f ship it")
+        # -> (False, True, "ship it")
+        parse_goal_flags("ship it")  # -> (False, False, "ship it")
+
+    The returned remainder has every flag token (and its value) stripped so
+    it can be fed straight to ``parse_contract`` / subcommand detection
+    without polluting the goal headline, contract, or command routing.
+    """
+    no_park = False
+    dont_ask_user_input = False
+    remainder = arg
+    while True:
+        candidate, rest = parse_no_park_prefix(remainder)
+        if rest != remainder:
+            no_park = candidate
+            remainder = rest
+            continue
+        candidate, rest = parse_dont_ask_user_input_prefix(remainder)
+        if rest != remainder:
+            dont_ask_user_input = candidate
+            remainder = rest
+            continue
+        return no_park, dont_ask_user_input, remainder
 
 
 def parse_contract(text: str) -> Tuple[str, GoalContract]:
@@ -450,6 +929,19 @@ class GoalState:
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: List[GoalGate] = field(default_factory=list)
+    # Per-goal WAIT-park override: when True the judge never returns a
+    # ``wait`` verdict (the loop treats WAIT as CONTINUE) and the judge
+    # prompt omits the WAIT section. Set via ``/goal no-park: #t``.
+    # Backwards-compatible: defaults to False so old state_meta rows load
+    # unchanged.
+    no_park: bool = False
+    # Per-goal unattended-run override: when True the continuation prompt
+    # and the judge prompt never mention asking the user for input, so the
+    # agent never stops to ask and keeps working until the goal is done or
+    # the budget is exhausted. Set via ``/goal dont-ask-user-input: #t``.
+    # Backwards-compatible: defaults to False so old state_meta rows load
+    # unchanged (goals behave exactly as before when the flag is unset).
+    dont_ask_user_input: bool = False
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -476,6 +968,8 @@ class GoalState:
                 GoalGate.from_dict(g) for g in (data.get("gates") or [])
                 if isinstance(g, dict) and str(g.get("command") or "").strip()
             ],
+            no_park=bool(data.get("no_park", False)),
+            dont_ask_user_input=bool(data.get("dont_ask_user_input", False)),
             **ints, **floats,
         )
 
@@ -771,6 +1265,50 @@ def _goal_judge_timeout() -> float:
     return _goal_judge_setting("timeout", DEFAULT_JUDGE_TIMEOUT, float)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# dont_ask_user_input hand-off guard
+#
+# These detect a judge that reverts to a user-input hand-off when the goal
+# runs fully unattended (``dont_ask_user_input=True``): with no user to hand
+# off to, a "done because the agent needs user input" verdict must not
+# complete the goal — it is really a CONTINUE signal. Plain ``blocked`` /
+# ``stuck`` wording is deliberately NOT matched here (only EXPLICIT user-input
+# hand-off language): the no-ask judge prompt already redirects a mere block
+# to CONTINUE, so this guard exists solely to catch a judge that ignores the
+# prompt and emits the old hand-off "done".
+# ──────────────────────────────────────────────────────────────────────
+_USER_INPUT_HANDOFF_PHRASES: frozenset[str] = frozenset({
+    "user input",
+    "input from the user",
+    "needs your input",
+    "ask the user",
+    "ask you",
+    "your input",
+    "hand off",
+    "handoff",
+    "stopped to ask",
+    "await your",
+    "waiting for your",
+    "need you to",
+})
+
+
+def _reason_indicates_user_input_block(reason: str) -> bool:
+    """Return True when a judge reason is really a hand-off to the user.
+
+    Case-insensitive substring match against explicit user-input hand-off
+    language (``_USER_INPUT_HANDOFF_PHRASES``). Used only as the deterministic
+    backstop for ``dont_ask_user_input=True`` judge calls — see the note above
+    for why bare ``blocked``/``stuck`` wording is excluded.
+    """
+    if not reason:
+        return False
+    lowered = reason.lower()
+    return any(phrase in lowered for phrase in _USER_INPUT_HANDOFF_PHRASES)
+
+
+
+
 def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
     """Best-effort: strip code fences, parse the blob, else pull the first ``{...}`` out."""
     if not raw:
@@ -899,12 +1437,27 @@ def judge_goal(
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
+    no_park: bool = False,
+    dont_ask_user_input: bool = False,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
     Returns ``(verdict, reason, parse_failed, wait_directive, transport_failed)``; verdict is done /
     blocked / continue / wait / skipped. ``parse_failed`` means unusable output; transport errors
     set ``transport_failed`` instead and fail-open to ``continue``.
+
+    ``no_park`` (default False) disables the WAIT verdict for this call: the system prompt is
+    built without the WAIT section (via ``_build_judge_system_prompt``) so the judge is never told
+    the verdict exists, and any ``"wait"`` verdict the model still returns is downgraded to
+    ``"continue"`` with ``wait_directive`` dropped — the loop never parks.
+
+    ``dont_ask_user_input`` (default False) runs the judge for a fully unattended goal: the system
+    and user prompts are built with the no-ask variants (via ``_build_judge_system_prompt`` /
+    ``_build_judge_user_prompt``), so BLOCKED is not offered and "blocked / needs user input" is
+    no longer a stopping condition — a ``"blocked"`` verdict is downgraded to ``"continue"``, and a
+    ``"done"`` verdict whose reason is merely an explicit user-input hand-off is downgraded to
+    ``"continue"`` too (the agent has nobody to hand off to and must keep working). When False the
+    behavior is byte-for-byte identical to today. ``dont_ask_user_input`` composes with ``no_park``.
     """
     if not goal.strip():
         return "skipped", "empty goal", False, None, False
@@ -922,27 +1475,47 @@ def judge_goal(
 
     # Prompt priority: contract > subgoals > plain. With both, subgoals fold into the contract
     # block as extra criteria so the judge sees a single source of truth.
+    # `_build_judge_user_prompt` owns all user-prompt assembly (contract >
+    # subgoals > plain, selecting the no-ask contract template when
+    # dont_ask_user_input is set) so the flag routes through ONE path;
+    # `_build_judge_system_prompt` composes no_park / dont_ask_user_input.
     clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
-    common = dict(
-        goal=_truncate(goal, 2000),
-        response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
-        background_block=_render_background_block(background_processes)
-        + (JUDGE_DELEGATIONS_BLOCK_TEMPLATE.format(count=active_delegations) if active_delegations > 0 else ""),
-        current_time=safe_strftime(datetime.now(tz=timezone.utc).astimezone(), "%Y-%m-%d %H:%M:%S %Z"),
-    )
+    background_block = _render_background_block(background_processes)
+    if active_delegations > 0:
+        background_block += JUDGE_DELEGATIONS_BLOCK_TEMPLATE.format(count=active_delegations)
+    # safe_strftime (upstream hardening): a zone name carrying surrogates raises
+    # UnicodeEncodeError inside strftime (#102910); safe_strftime renders %Z from the
+    # repaired name instead and is byte-identical to strftime for valid locale text.
+    current_time = safe_strftime(datetime.now(tz=timezone.utc).astimezone(), "%Y-%m-%d %H:%M:%S %Z")
+
+    contract_block = None
+    subgoals_block = None
     if contract is not None and not contract.is_empty():
         contract_block = contract.render_block()
         if clean_subgoals:
-            contract_block = f"{contract_block}\n{_render_extra_criteria(clean_subgoals)}"
-        prompt = JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE.format(contract_block=_truncate(contract_block, 2500), **common)
+            extra = "\n".join(
+                f"- Extra criterion {i}: {text}"
+                for i, text in enumerate(clean_subgoals, start=1)
+            )
+            contract_block = f"{contract_block}\n{extra}"
     elif clean_subgoals:
-        subgoals_block = "\n".join(f"- {i}. {text}" for i, text in enumerate(clean_subgoals, start=1))
-        prompt = JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE.format(subgoals_block=_truncate(subgoals_block, 2000), **common)
-    else:
-        prompt = JUDGE_USER_PROMPT_TEMPLATE.format(**common)
+        subgoals_block = "\n".join(
+            f"- {i}. {text}" for i, text in enumerate(clean_subgoals, start=1)
+        )
+    prompt = _build_judge_user_prompt(
+        goal,
+        last_response,
+        background_block,
+        current_time,
+        contract_block=contract_block,
+        subgoals_block=subgoals_block,
+        dont_ask_user_input=dont_ask_user_input,
+    )
 
     try:
-        raw = _call_goal_judge_llm(call_llm, JUDGE_SYSTEM_PROMPT, prompt, timeout)
+        raw = _call_goal_judge_llm(
+            call_llm, _build_judge_system_prompt(no_park, dont_ask_user_input), prompt, timeout
+        )
     except AuxiliaryClientUnavailable as exc:
         # No client at all (e.g. a dead Nous refresh token): name the cause so the user is sent to
         # re-authenticate, not to context-length / model debugging (#42177). Still fails open.
@@ -953,6 +1526,41 @@ def judge_goal(
         return "continue", f"judge error: {type(exc).__name__}", False, None, True
 
     verdict, reason, parse_failed, wait_directive = _parse_judge_response(raw)
+    if no_park and verdict == "wait":
+        # no-park goal: never park the loop. Downgrade WAIT to CONTINUE and
+        # discard the wait directive so the caller won't set a wait barrier.
+        logger.info(
+            "goal judge: no_park downgrade wait -> continue (directive dropped): %s",
+            wait_directive,
+        )
+        verdict = "continue"
+        wait_directive = None
+    if dont_ask_user_input and verdict == "blocked":
+        # dont-ask-user-input goal: a BLOCKED verdict would pause the loop for
+        # user re-scope — the one stop the flag forbids. The no-ask judge
+        # prompt does not offer BLOCKED, so this only catches a stray verdict;
+        # downgrade to CONTINUE so the agent keeps working.
+        logger.info(
+            "goal judge: dont_ask_user_input downgrade blocked -> continue: %s",
+            _truncate(reason, 120),
+        )
+        verdict = "continue"
+        wait_directive = None
+    if (
+        dont_ask_user_input
+        and verdict == "done"
+        and _reason_indicates_user_input_block(reason)
+    ):
+        # dont-ask-user-input goal: the agent has nobody to hand off to, so a
+        # "done" whose only basis is an explicit user-input hand-off must not
+        # complete the goal. Downgrade to CONTINUE and keep the reason (the
+        # loop will continue pushing and re-judge).
+        logger.info(
+            "goal judge: dont_ask_user_input downgrade done -> continue "
+            "(reason indicates user-input hand-off): %s",
+            _truncate(reason, 120),
+        )
+        verdict = "continue"
     logger.info("goal judge: verdict=%s reason=%s%s", verdict, _truncate(reason, 120),
                 f" wait={wait_directive}" if wait_directive else "")
     return verdict, reason, parse_failed, wait_directive, False
@@ -1164,7 +1772,15 @@ class GoalManager:
         self._pause_state(paused_reason)
         return _decision("paused", False, None, verdict, reason, message)
 
-    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
+    def set(
+        self,
+        goal: str,
+        *,
+        max_turns: Optional[int] = None,
+        contract: Optional[GoalContract] = None,
+        no_park: bool = False,
+        dont_ask_user_input: bool = False,
+    ) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
@@ -1172,6 +1788,8 @@ class GoalManager:
             goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
             contract=contract if contract is not None else GoalContract(),
+            no_park=no_park,
+            dont_ask_user_input=dont_ask_user_input,
         )
         return self._save()
 
@@ -1506,6 +2124,8 @@ class GoalManager:
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
+            no_park=state.no_park,
+            dont_ask_user_input=state.dont_ask_user_input,
         )
         state.last_verdict = verdict
         state.last_reason = reason
@@ -1566,15 +2186,30 @@ class GoalManager:
         s = self._state
         if not s or s.status != "active":
             return None
-        # Contract first (it carries the verification surface); subgoals fold in as extra criteria.
-        if s.has_contract():
-            contract_block = s.contract.render_block()
-            if s.subgoals:
-                contract_block = f"{contract_block}\n{_render_extra_criteria(s.subgoals)}"
-            return CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(goal=s.goal, contract_block=contract_block)
-        if s.subgoals:
-            return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(goal=s.goal, subgoals_block=s.render_subgoals_block())
-        return CONTINUATION_PROMPT_TEMPLATE.format(goal=s.goal)
+        # Contract takes priority: it carries the verification surface and
+        # constraints the agent must target. Subgoals fold in as extra
+        # criteria appended to the contract block.
+        return _build_continuation_prompt(
+            self._state.goal,
+            contract_block=(
+                self._build_contract_block() if self._state.has_contract() else None
+            ),
+            subgoals_block=(
+                self._state.render_subgoals_block() if self._state.subgoals else None
+            ),
+            dont_ask_user_input=self._state.dont_ask_user_input,
+        )
+
+    def _build_contract_block(self) -> str:
+        """Render the contract block, folding subgoals in as extra criteria."""
+        contract_block = self._state.contract.render_block()
+        if self._state.subgoals:
+            extra = "\n".join(
+                f"- Extra criterion {i}: {text}"
+                for i, text in enumerate(self._state.subgoals, start=1)
+            )
+            contract_block = f"{contract_block}\n{extra}"
+        return contract_block
 
     def render_contract(self) -> str:
         """Public helper for the /goal show + /goal draft slash commands."""
@@ -1736,11 +2371,32 @@ def run_kanban_goal_loop(
 
 
 __all__ = [
-    "GoalState", "GoalContract", "GoalGate", "GoalManager", "parse_contract", "draft_contract", "run_gate",
-    "CONTINUATION_PROMPT_TEMPLATE", "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
-    "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE", "JUDGE_USER_PROMPT_TEMPLATE",
-    "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE", "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE",
-    "DRAFT_CONTRACT_SYSTEM_PROMPT", "KANBAN_GOAL_CONTINUATION_TEMPLATE", "KANBAN_GOAL_FINALIZE_TEMPLATE",
-    "DEFAULT_MAX_TURNS", "load_goal", "save_goal", "clear_goal", "migrate_goal_to_session", "judge_goal",
+    "GoalState",
+    "GoalContract",
+    "GoalGate",
+    "GoalManager",
+    "_build_continuation_prompt",
+    "_build_judge_user_prompt",
+    "parse_no_park_prefix",
+    "parse_dont_ask_user_input_prefix",
+    "parse_goal_flags",
+    "parse_contract",
+    "draft_contract",
+    "run_gate",
+    "CONTINUATION_PROMPT_TEMPLATE",
+    "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
+    "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE",
+    "JUDGE_USER_PROMPT_TEMPLATE",
+    "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE",
+    "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE",
+    "DRAFT_CONTRACT_SYSTEM_PROMPT",
+    "KANBAN_GOAL_CONTINUATION_TEMPLATE",
+    "KANBAN_GOAL_FINALIZE_TEMPLATE",
+    "DEFAULT_MAX_TURNS",
+    "load_goal",
+    "save_goal",
+    "clear_goal",
+    "migrate_goal_to_session",
+    "judge_goal",
     "run_kanban_goal_loop",
 ]

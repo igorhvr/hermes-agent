@@ -134,8 +134,23 @@ def _gate(mgr, arg, authorize_gate):
         return GoalCommandResult(f"/goal gate {operation}: {exc}", error=True)
 
 
-def _set(mgr, arg, *, drafting, last_user_message, render, progress):
+def _set(mgr, arg, *, drafting, last_user_message, render, progress, no_park=False, dont_ask_user_input=False):
     if drafting:
+        if not arg:
+            return GoalCommandResult("Usage: /goal draft <objective in plain language>", error=True)
+        # The per-goal flag overrides are honored on the draft path too, in
+        # either ordering: /goal draft no-park: #t <obj> (token after the
+        # subcommand) or /goal no-park: #t draft <obj> (already stripped
+        # above). Parse and strip any flag tokens here so the objective
+        # handed to draft_contract stays clean, and an invalid value on the
+        # draft path errors out exactly like the plain set path.
+        try:
+            draft_no_park, draft_dont_ask, objective = goals.parse_goal_flags(arg)
+        except ValueError as exc:
+            return GoalCommandResult(f"/goal draft: {exc}", error=True)
+        no_park = no_park or draft_no_park
+        dont_ask_user_input = dont_ask_user_input or draft_dont_ask
+        arg = objective
         if not arg:
             return GoalCommandResult("Usage: /goal draft <objective in plain language>", error=True)
         if progress is not None:
@@ -150,7 +165,12 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
         headline, contract = goals.parse_contract(arg)
         contract = contract if not contract.is_empty() else None
     previous = mgr.state.goal if mgr.has_goal() else ""
-    state = mgr.set(headline or arg, contract=contract)
+    state = mgr.set(
+        headline or arg,
+        contract=contract,
+        no_park=no_park,
+        dont_ask_user_input=dont_ask_user_input,
+    )
     output = render("gateway.goal.set", "⊙ Goal set ({budget}-turn budget): {goal}",
                     budget=state.max_turns, goal=state.goal)
     if previous and previous != state.goal:
@@ -190,6 +210,17 @@ def dispatch_goal_command(
     ContextVars so draft credentials and persisted I/O stay in the caller's profile.
     """
     arg = arg.strip()
+    # Optional SRFI-88-style per-goal flag prefixes on the goal text:
+    #   /goal no-park: #t <goal text>             -> disable WAIT-parking
+    #   /goal dont-ask-user-input: #t <goal text> -> run fully unattended
+    # Both compose in either order; any other value errors out before a goal
+    # is set. The tokens are stripped here so subcommand detection
+    # (draft/wait/gate/…) only ever sees the goal text — a flag token can
+    # never be misread as a subcommand or goal text.
+    try:
+        no_park, dont_ask_user_input, arg = goals.parse_goal_flags(arg)
+    except ValueError as exc:
+        return GoalCommandResult(render("gateway.goal.invalid", "Invalid goal: {error}", error=str(exc)), error=True)
     tokens = arg.split(None, 1)
     verb = tokens[0].lower() if tokens else ""
     rest = tokens[1].strip() if len(tokens) > 1 else ""
@@ -211,7 +242,8 @@ def dispatch_goal_command(
             return _gate(mgr, rest, authorize_gate)
         return _set(mgr, rest if verb == "draft" else arg,
                     drafting=verb == "draft", last_user_message=last_user_message,
-                    render=render, progress=progress)
+                    render=render, progress=progress, no_park=no_park,
+                    dont_ask_user_input=dont_ask_user_input)
     except (RuntimeError, ValueError, IndexError) as exc:
         output = (render("gateway.goal.invalid", "Invalid goal: {error}", error=str(exc))
                   if prefix == "Invalid goal" else f"{prefix}: {exc}")
