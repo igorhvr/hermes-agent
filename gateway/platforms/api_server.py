@@ -224,6 +224,9 @@ MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 32_000_000  # 32 MB limit for rich OpenAI-style multimodal payloads
 # Send a comment before remote API clients' common 20-second idle deadline.
 # This constant is shared by OpenAI chat/Responses and native session SSE.
+# Kept at upstream's 10s over the multimodal feature's 30s: upstream
+# deliberately tightened the cadence for 20s-idle clients, and the
+# multimodal payload cost lives in MAX_REQUEST_BYTES, not the heartbeat.
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 10.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
