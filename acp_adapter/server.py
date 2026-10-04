@@ -548,6 +548,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 ),
             ),
             auth_methods=auth_methods,
+            field_meta={"steering": {"supported": True}},
         )
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
@@ -702,6 +703,52 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         ]
         next_cursor = sessions[-1].session_id if has_more and sessions else None
         return ListSessionsResponse(sessions=sessions, next_cursor=next_cursor)
+
+    # ---- Extensions ---------------------------------------------------------
+
+    async def ext_method(self, method: str, params: dict[str, Any]) -> Any:
+        """ACP extension requests (the router passes the method name without its leading ``_``).
+
+        Advertised via ``_meta.steering.supported``; currently only
+        ``session/steering`` (``_session/steering``): inject a prompt into the
+        turn already running instead of queueing it behind the turn.
+        """
+        if method == "session/steering":
+            return await self._steer_session(params)
+        from acp.exceptions import RequestError
+        raise RequestError.method_not_found(f"_{method}")
+
+    async def _steer_session(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Handle ``_session/steering``: steer a prompt into the running turn.
+
+        Mirrors the turn-claim path's redirect semantics: redirect when the
+        runtime supports active-turn correction, queue at the session
+        otherwise, so the text is never lost.  Always answers ``injected``
+        (the client renders the prompt as steered; queued text is delivered
+        at the turn boundary).
+        """
+        session_id = str(payload.get("sessionId") or "")
+        prompt = payload.get("prompt") or []
+        text = "\n".join(
+            str(block.get("text")) for block in prompt
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
+        ).strip()
+        state = await asyncio.to_thread(self.session_manager.get_session, session_id)
+        if state is None or not text:
+            return {"outcome": "promptRequired"}
+        redirected = False
+        with state.runtime_lock:
+            agent = state.agent
+            if (state.is_running and hasattr(agent, "redirect")
+                    and getattr(agent, "_supports_active_turn_redirect", False) is True):
+                try:
+                    redirected = bool(agent.redirect(text))
+                except Exception:
+                    logger.debug("Steering redirect failed for %s", session_id, exc_info=True)
+            if not redirected:
+                state.queued_prompts.append(text)
+        logger.info("Steered prompt into session %s (redirected=%s)", session_id, redirected)
+        return {"outcome": "injected"}
 
     # ---- Prompt (core) ------------------------------------------------------
 
