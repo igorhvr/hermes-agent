@@ -67,6 +67,11 @@ class SlashCommandsMixin:
             "prompt to run next",
         ),
         "version": ("Show Hermes version", "Show Hermes version", None),
+        "yolo": (
+            "Toggle YOLO mode (skip dangerous command approvals)",
+            "Toggle YOLO mode (skip dangerous command approvals)",
+            "on | off (no argument toggles)",
+        ),
     }
 
 
@@ -310,3 +315,26 @@ class SlashCommandsMixin:
         from hermes_cli.version_info import get_version_info
 
         return f"Hermes Agent v{get_version_info().derived_version}"
+
+    def _cmd_yolo(self, args: str, state: SessionState) -> str:
+        """``/yolo [on|off]`` — toggle per-session dangerous-command bypass.
+
+        Session-lifetime only (nothing is persisted to the session row; a
+        later ``--resume`` starts asking again).  Covers dangerous-command
+        approvals; edit approvals stay governed by the ACP session mode.
+        """
+        from tools.approval import disable_session_yolo, enable_session_yolo, is_session_yolo_enabled
+
+        session_key = state.session_id
+        arg = args.strip().lower()
+        if arg in {"on", "true", "1", "yes", "enable"}:
+            enable_session_yolo(session_key)
+        elif arg in {"off", "false", "0", "no", "disable"}:
+            disable_session_yolo(session_key)
+        elif arg in {"", "toggle"}:
+            (disable_session_yolo if is_session_yolo_enabled(session_key) else enable_session_yolo)(session_key)
+        else:
+            return "Usage: /yolo [on|off]"
+        if is_session_yolo_enabled(session_key):
+            return "⚡ YOLO mode ON — all dangerous commands auto-approved. (Edit prompts are governed by the session mode.)"
+        return "⚠ YOLO mode OFF — dangerous commands require approval."
