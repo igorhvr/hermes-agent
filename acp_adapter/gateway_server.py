@@ -146,11 +146,72 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 prompt_capabilities=PromptCapabilities(image=True),
                 session_capabilities=SessionCapabilities(fork=SessionForkCapabilities(), list=SessionListCapabilities(),
                                                          resume=SessionResumeCapabilities())),
-            auth_methods=build_auth_methods())
+            auth_methods=build_auth_methods(),
+            # A gateway-backed session serves turns exactly like the direct agent, so it must
+            # advertise the same steering extension: a client that does not see it silently
+            # queues a mid-turn prompt instead of steering it (tracker ACP steering).
+            field_meta={"steering": {"supported": True}})
 
     async def authenticate(self, method_id, **kwargs):
         from acp_adapter.server import HermesACPAgent
         return await HermesACPAgent.authenticate(self, method_id, **kwargs)
+
+    async def ext_method(self, method, params):
+        """ACP extension requests (the router passes the method name without its leading ``_``).
+
+        Advertised via ``_meta.steering.supported``; mirrors the direct agent's
+        ``session/steering`` (``_session/steering``): inject a prompt into the
+        turn already running instead of queueing it behind the turn.
+        """
+        if method == "session/steering":
+            return await self._steer_session(params)
+        from acp.exceptions import RequestError
+        raise RequestError.method_not_found(f"_{method}")
+
+    async def _steer_session(self, payload):
+        """Handle ``_session/steering`` against the owning gateway.
+
+        The owner's correction RPCs carry the redirect-then-steer semantics the
+        direct agent applies in-process: redirect a live turn when the runtime
+        supports it, otherwise splice the text into the running turn, and queue
+        it as the next prompt when neither accepts (idle / compression).  The
+        answer is always ``injected`` so the client renders the prompt as
+        steered; queued text is delivered at the turn boundary.
+        """
+        from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError
+        raw_id = str(payload.get("sessionId") or "")
+        session_id = self._aliases.get(raw_id, raw_id)
+        text = "\n".join(
+            str(block.get("text")) for block in payload.get("prompt") or []
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
+        ).strip()
+        snapshot = self._snapshots.get(session_id)
+        if snapshot is None or not text:
+            return {"outcome": "promptRequired"}
+        # ``session.redirect`` / ``session.steer`` are generation-fenced: the owner only applies
+        # the text to the claim it names, so a correction cannot land in a later turn.
+        generation = snapshot.get("execution_generation")
+        try:
+            client = await self._client()
+            status = ""
+            if isinstance(generation, int) and snapshot.get("running") is True:
+                for verb in ("session.redirect", "session.steer"):
+                    try:
+                        status = (await client.rpc(
+                            verb, session_id=session_id, text=text,
+                            execution_generation=generation)).get("status", "")
+                    except GatewayRPCError:
+                        continue
+                    if status in ("redirected", "queued"):
+                        break
+            if status not in ("redirected", "queued"):
+                # Idle, compression, or a claim that outlived its agent: deliver as the next prompt.
+                await client.rpc("prompt.submit", session_id=session_id,
+                                 input_id=uuid.uuid4().hex, text=text)
+        except GatewayClientError:
+            return {"outcome": "promptRequired"}
+        logger.info("Steered prompt into gateway session %s (status=%s)", session_id, status)
+        return {"outcome": "injected"}
 
     async def _client(self):
         async with self._connect_lock:
