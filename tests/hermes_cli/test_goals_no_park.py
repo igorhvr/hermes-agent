@@ -135,6 +135,9 @@ class _RealGoalHarness:
         self.cli_mod = cli_mod
         self.shell = cli_mod.HermesCLI(compact=True, max_turns=1)
         self.shell.session_id = session_id
+        # A plain offline CLI keeps main's in-process managers: with a gateway session store
+        # and no open gateway connection the automation lookup would answer None.
+        self.shell._session_db = None
         # Force the handler to construct a real GoalManager bound to the
         # temp HERMES_HOME instead of leaving a stale mock in place.
         self.shell._goal_manager = None
