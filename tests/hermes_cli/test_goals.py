@@ -2194,6 +2194,9 @@ class _GoalCommandHarness:
         self.mgr = MagicMock()
         self.mgr.session_id = "test-session"
         self.shell.session_id = "test-session"
+        # A plain offline CLI keeps main's in-process managers: with a gateway session store
+        # and no open gateway connection the automation lookup would answer None.
+        self.shell._session_db = None
         self.shell._goal_manager = self.mgr
 
     def run(self, cmd_text: str, goal_text: str = "fake goal"):
