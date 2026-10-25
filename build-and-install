@@ -6,14 +6,18 @@ cd "$(dirname "$0")"
 echo "==> Removing existing venv (if any)..."
 rm -rf ./venv
 
-echo "==> Creating venv with uv (SQLite >=3.51.3 required)..."
+echo "==> Creating venv with uv (Python 3.14; SQLite >=3.51.3 required)..."
+# The runtime is Python 3.14 (`.python-version`, and [tool.uv] environments says
+# "3.11 is an install bridge for pre-PM updaters, never a runtime"). The core
+# dependencies in pyproject.toml carry a `python_version >= '3.14'` marker, so
+# creating this venv on an older interpreter installs no runtime deps at all
+# and `hermes` fails at import (e.g. ModuleNotFoundError: ruamel).
+#
 # SQLite 3.7.0–3.51.2 (excluding the 3.50.7 / 3.44.6 backports) carries the
-# WAL-reset corruption bug (https://sqlite.org/wal.html#walresetbug). The
-# uv-managed CPython 3.11.14 build links SQLite 3.50.4 — vulnerable — and a
-# bare "3.11" request resolves to that already-cached patch instead of
-# downloading a newer one, silently reproducing the bug. Pin >=3.11.15 (links
-# SQLite 3.53.1) so the venv is never created against a vulnerable runtime.
-uv venv ./venv --python '>=3.11.15'
+# WAL-reset corruption bug (https://sqlite.org/wal.html#walresetbug). The guard
+# below still fails the build loudly if the interpreter uv resolves links a
+# vulnerable SQLite, so a future regression is never silent.
+uv venv ./venv --python '>=3.14,<3.15'
 
 # Belt-and-suspenders: fail loudly instead of shipping a vulnerable runtime.
 # If a future patch regressed, or uv resolved something unexpected, stop here
@@ -25,11 +29,25 @@ if ! ./venv/bin/python -c 'import sqlite3, sys; sys.exit(0 if sqlite3.sqlite_ver
   exit 1
 fi
 
-echo "==> Installing hermes-agent in editable mode..."
-uv pip install -e . --python ./venv/bin/python
+echo "==> Installing hermes-agent in editable mode (core + [all] + acp)..."
+# [all] bundles the extras that cannot be lazy-installed at first use
+# (mcp/web/google/acp/...); acp is called out explicitly so the ACP adapter
+# keeps working even if the [all] bundle changes. WhatsApp's Python client
+# dependency (aiohttp) is installed explicitly in its own step below.
+uv pip install -e ".[all,acp]" --python ./venv/bin/python
 
 echo "==> Installing dev toolchain (pytest, ruff, etc.)..."
-uv pip install -e ".[dev]" --python ./venv/bin/python
+# `dev` is a PEP 735 dependency group, not a project extra — `.[dev]` silently
+# resolves to just the core package with a "does not have an extra named dev"
+# warning, so the toolchain must be requested with --group.
+uv pip install --group dev --python ./venv/bin/python
+
+echo "==> Installing WhatsApp bridge Python client (aiohttp)..."
+# The adapter (plugins/platforms/whatsapp/adapter.py) talks to its local
+# Node.js bridge over HTTP via aiohttp; the WhatsApp bridge is the only
+# consumer that needs it here, so pin it explicitly rather than trusting the
+# [all] -> [sms] transitive to keep providing it.
+uv pip install "aiohttp==3.14.3" --python ./venv/bin/python
 
 echo "==> Installing WhatsApp bridge Node dependencies..."
 BRIDGE_DIR="scripts/whatsapp-bridge"
@@ -37,11 +55,26 @@ if [ -f "$BRIDGE_DIR/package.json" ]; then
   # Force clean install — git deps (@whiskeysockets/baileys) can fail silently
   rm -rf "$BRIDGE_DIR/node_modules"
   (cd "$BRIDGE_DIR" && npm install --no-fund --no-audit)
+  if [ ! -d "$BRIDGE_DIR/node_modules/@whiskeysockets/baileys" ]; then
+    echo "error: WhatsApp bridge install incomplete — baileys is missing" >&2
+    exit 1
+  fi
   echo "   ✓ WhatsApp bridge deps installed"
 else
   echo "   ⚠ $BRIDGE_DIR/package.json not found, skipping"
 fi
 
+echo "==> Verifying ACP and WhatsApp Python dependencies..."
+./venv/bin/python - <<'PY'
+from importlib import import_module
+from importlib.metadata import version
+
+for module, dist in (("acp", "agent-client-protocol"), ("aiohttp", "aiohttp")):
+    import_module(module)
+    print(f"   ✓ {dist} {version(dist)}")
+PY
+
 echo "==> Done!"
 echo ""
-echo "Try: ./venv/bin/hermes whatsapp"
+echo "Try: hermes whatsapp"
+echo "     hermes acp"
