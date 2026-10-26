@@ -1643,4 +1643,3 @@ class OpenAICompatRoutesMixin:
             from gateway.platforms.api_server_response_identity import identify_output
             return identify_output(items, response_id)
         return items
-        return items
