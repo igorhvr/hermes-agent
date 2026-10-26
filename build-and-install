@@ -47,7 +47,7 @@ echo "==> Installing WhatsApp bridge Python client (aiohttp)..."
 # Node.js bridge over HTTP via aiohttp; the WhatsApp bridge is the only
 # consumer that needs it here, so pin it explicitly rather than trusting the
 # [all] -> [sms] transitive to keep providing it.
-uv pip install "aiohttp==3.14.3" --python ./venv/bin/python
+uv pip install "aiohttp==3.14.5" --python ./venv/bin/python
 
 echo "==> Installing WhatsApp bridge Node dependencies..."
 BRIDGE_DIR="scripts/whatsapp-bridge"
