@@ -8,6 +8,44 @@ from acp_adapter.session import (
 )
 
 
+def _unset_acp_receipt_rows(db):
+    """Rows whose private local receipt proves ACP creation but whose ``created_source`` an older
+    owner left unset (its first routing write relabelled the row to ``local``). The receipt's own
+    policy is the provenance, so the picker still lists them before the owner's boot repair runs."""
+    from hermes_state_compression import _UNSET_CREATED_SQL
+    from hermes_state_local import POLICY_PREFIX
+    with db._read_ctx() as conn:
+        # A read-only open does not migrate: a store from before the column has nothing to repair.
+        if not any(row[1] == 'created_source' for row in conn.execute('PRAGMA table_info(sessions)')):
+            return {}
+        receipts = conn.execute('SELECT value FROM state_meta WHERE key GLOB ?', (POLICY_PREFIX + '*',)).fetchall()
+    ids = []
+    for (raw,) in receipts:
+        try:
+            receipt = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        policy = receipt.get('policy') if isinstance(receipt, dict) else None
+        if not isinstance(policy, dict) or policy.get('source') != 'acp':
+            continue
+        for sid in (receipt.get('session_id'), *(receipt.get('lineage') or ())):
+            if isinstance(sid, str) and sid not in ids:
+                ids.append(sid)
+    unset = []
+    with db._read_ctx() as conn:
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            unset.extend(row[0] for row in conn.execute(
+                f"SELECT id FROM sessions WHERE id IN ({','.join('?' * len(chunk))}) AND source='local' AND "
+                + _UNSET_CREATED_SQL.format(col='created_source'), chunk))
+    rows = {}
+    for sid in unset:
+        row = db.get_session(sid)
+        if row is not None and not row.get('hidden') and not row.get('archived'):
+            rows[sid] = row
+    return rows
+
+
 def read_catalog_rows(path):
     path = Path(path)
     if not path.exists():
@@ -17,7 +55,9 @@ def read_catalog_rows(path):
     # reader matches both labels in SQL, before the LIMIT.
     with SessionDB(db_path=path, read_only=True) as db:
         rows = SurfaceLabelReader(db).list_sessions_rich(source="acp", limit=1000)
-        return {str(row["id"]): dict(row) for row in rows}
+        catalog = {str(row["id"]): dict(row) for row in rows}
+        catalog.update(_unset_acp_receipt_rows(db))
+        return catalog
 
 
 def _local_owners(db):

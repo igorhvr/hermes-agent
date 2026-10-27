@@ -86,6 +86,25 @@ def commit_local_session(db, *, epoch, receipt):
         raise
 
 
+def stamp_created_source(db, session_id, source):
+    """Repair an unset ``created_source`` from the session's own creation policy (an older owner's
+    routing write relabelled ``source`` to ``local`` and left the provenance ``unknown``). Never
+    overwrites a real surface; a repair of a compression tip stamps its unset ancestors too."""
+    from gateway.session_policy import created_surface
+    from hermes_state_compression import _UNSET_CREATED_SQL, stamp_compression_ancestors
+    surfaced = created_surface(source)
+    if not surfaced:
+        return 0
+    def write(conn):
+        changed = conn.execute(
+            "UPDATE sessions SET created_source=? WHERE id=? AND " + _UNSET_CREATED_SQL.format(col="created_source"),
+            (surfaced, session_id)).rowcount
+        if changed:
+            stamp_compression_ancestors(conn, session_id)
+        return changed
+    return db._execute_write(write)
+
+
 def client_request(request_json, derived=None):
     """A frozen create request as the client sent it: an owner-resolved ``-m`` route (``model_requested``)
     compares by the name the client typed, not by the model and the *derived* fields (a receipt from

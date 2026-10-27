@@ -91,7 +91,7 @@ def _with_untracked_compression(authority, sid, receipt):
 
 
 def _checked_entry(authority, receipt, source, route):
-    """*receipt*'s entry, once its route, origin and stored identity are this authority's."""
+    """*receipt*'s entry and its stored row, once its route, origin and identity are this authority's."""
     if receipt['route'] != route:
         raise ValueError('route mismatch')
     entry = SessionEntry.from_dict(receipt['entry'])
@@ -106,11 +106,11 @@ def _checked_entry(authority, receipt, source, route):
     row = authority.db.get_session(entry.session_id)
     if row is None or (row['session_key'], row['chat_id'], row['user_id']) != (route, source.chat_id, source.user_id):
         raise ValueError('stored identity mismatch')
-    return entry
+    return entry, row
 
 
 def owned_receipt(authority, sid):
-    """*sid*'s stored receipt with its LOCAL source, route and entry, once all are this owner's."""
+    """*sid*'s stored receipt with its LOCAL source, route, entry and row, once all are this owner's."""
     receipt = local_receipt(authority.db, sid)
     if receipt['profile_id'] != authority.profile_id:
         raise RuntimeStoreError('profile_mismatch')
@@ -120,7 +120,8 @@ def owned_receipt(authority, sid):
         raise ValueError('identity mismatch')
     source = local_source(authority, chat_id, receipt['principal_id'])
     route = authority.runner.session_store._generate_session_key(source)
-    return receipt, source, route, _checked_entry(authority, receipt, source, route)
+    entry, row = _checked_entry(authority, receipt, source, route)
+    return receipt, source, route, entry, row
 
 
 def unused_session(conn, session_id):
@@ -156,12 +157,12 @@ def restore_local_session(authority, sid):
     from gateway.session_policy import restore_policy
     try:
         # The catch-up writes, so the receipt as stored must already be this owner's (#140060).
-        receipt, source, route, entry = owned_receipt(authority, sid)
+        receipt, source, route, entry, row = owned_receipt(authority, sid)
         chat_id, store = source.chat_id, authority.runner.session_store
         adopted = _with_untracked_compression(authority, sid, receipt)
         policy = restore_policy(adopted['policy'])
         if adopted is not receipt:  # re-read after a catch-up: check the copy that will be served
-            receipt, entry = adopted, _checked_entry(authority, adopted, source, route)
+            receipt, (entry, row) = adopted, _checked_entry(authority, adopted, source, route)
         target = entry.session_id
         from hermes_state_local_lineage import validate_local_lineage
         with authority.db._read_ctx() as conn:
@@ -174,7 +175,21 @@ def restore_local_session(authority, sid):
         if isinstance(exc, RuntimeStoreError):
             raise _ReceiptRefused(exc.reason, field=exc.field, detail=exc.detail) from exc
         raise _ReceiptRefused('storage_unavailable') from exc
-    adapter = local_adapter(authority)
+    # An older owner's first routing write relabelled a receipt's row to ``local`` and left its
+    # ``created_source`` unset, so ACP's surface-filtered picker can never match it again. The
+    # receipt's own policy is the provenance: restore it here, at boot and on every open.
+    from gateway.session_policy import created_surface
+    if created_surface(policy.source) and not created_surface(row.get('created_source')):
+        from hermes_state_local import stamp_created_source
+        try:
+            stamp_created_source(authority.db, target, policy.source)
+        except Exception:  # health: allow BLE001 -- provenance repair never blocks the restore
+            logging.getLogger(__name__).warning('Could not stamp created_source for %s', target, exc_info=True)
+    adapters = local_adapter_map(authority)
+    adapter = adapters.get(Platform.LOCAL)
+    if adapter is None:
+        adapter = LocalSessionAdapter(authority)
+        adapters[Platform.LOCAL] = adapter
     if not isinstance(adapter, LocalSessionAdapter) or adapter.authority is not authority:
         raise RuntimeStoreError('runtime_draining')
     live = authority.sessions.get(sid)
