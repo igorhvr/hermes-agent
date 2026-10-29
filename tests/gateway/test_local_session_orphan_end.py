@@ -14,6 +14,11 @@ import pytest
 from tests.waiting import async_wait_until
 
 
+def _delete_journal(home):
+    """The operator's rollback-journal store: a read takes the writer mutex (no WAL read pool)."""
+    (home / 'config.yaml').write_text('database:\n  journal_mode: delete\n')
+
+
 async def _owner(tmp_path, monkeypatch):
     from gateway import run
     from gateway.config import GatewayConfig
@@ -212,6 +217,27 @@ async def test_work_finishing_after_close_and_restart_is_noted_on_the_ended_sess
     finally:
         authority.db.close()
         delegation._reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('journal_mode', ['delete', 'wal'])
+async def test_boot_recovery_arms_the_orphan_close_on_a_delete_journal_store(tmp_path, monkeypatch, journal_mode):
+    """DELETE mode serves reads under the writer mutex; the startup idleness probe must not
+    re-enter that read on its own thread (it froze the event loop and the watchdog exited 75)."""
+    from gateway.session_local_recovery import recover_local_sessions
+
+    if journal_mode == 'delete':
+        _delete_journal(tmp_path)
+    armed = _capture_timers(monkeypatch)
+    _stale_rows(monkeypatch)
+    first, _ = await _owner(tmp_path, monkeypatch)
+    assert first.db._wal_active is (journal_mode == 'wal')
+    sid = _create(first).session_id
+    await _attach(first, sid)  # the gateway stops with this viewer attached: no detach ever runs
+
+    authority, _ = await _owner(tmp_path, monkeypatch)
+    recover_local_sessions(authority, schedule=True)
+    assert [delay for delay, _ in armed] == [300.0]
 
 
 @pytest.mark.asyncio

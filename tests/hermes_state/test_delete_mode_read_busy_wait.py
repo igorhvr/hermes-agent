@@ -8,6 +8,7 @@ gateway was writing. The holder here is a separate process, as in production.
 
 import subprocess
 import sys
+import threading
 
 import pytest
 import hermes_yaml as yaml
@@ -39,6 +40,24 @@ def delete_mode_db(tmp_path, monkeypatch):
     db.append_message("s1", role="user", content="hello")
     yield db
     db.close()
+
+
+def test_delete_mode_nested_read_on_one_thread_does_not_self_deadlock(delete_mode_db):
+    """A helper that reads inside another read must not wait on the lock its own thread holds.
+    The writer mutex is re-entrant, so nested reads behave like the WAL pooled-read path."""
+    result = {}
+
+    def nested_reads():
+        with delete_mode_db._read_ctx() as outer:
+            assert outer.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
+            with delete_mode_db._read_ctx() as inner:
+                result["count"] = inner.execute("SELECT count(*)+1 FROM sessions").fetchone()[0]
+
+    worker = threading.Thread(target=nested_reads, daemon=True)
+    worker.start()
+    worker.join(10)
+    assert not worker.is_alive(), "nested DELETE-mode read self-deadlocked on SessionDB._lock"
+    assert result["count"] == 2
 
 
 @pytest.mark.parametrize("read_only", [True, False], ids=["read_only_handle", "writer_handle"])

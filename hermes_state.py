@@ -597,7 +597,9 @@ class SessionDB(
             pass  # Diagnostic metadata must not prevent opening the database.
         finally:
             del caller
-        self._lock = threading.Lock()
+        # Re-entrant: under DELETE journal mode _read_ctx serves reads from the writer connection
+        # under this lock, and a helper that reads inside another read must not self-deadlock.
+        self._lock = threading.RLock()
         # Read-path split (WAL only): reads borrow from a BOUNDED read-only pool so they
         # never queue behind writer flushes on self._lock (see _read_ctx); unbounded
         # per-thread connections pinned fds for the process lifetime and hit EMFILE.
