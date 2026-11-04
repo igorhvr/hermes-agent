@@ -315,7 +315,7 @@ class TestGoalDontAskUserInputE2E:
         fresh = goals.GoalManager(session_id=_RealGoalHarness.SESSION)
         _assert_dont_ask_state(fresh, expected=True)
 
-        captured, decision = _evaluate_with_mocked_judge(
+        _captured, decision = _evaluate_with_mocked_judge(
             fresh, USER_INPUT_HANDOFF_DONE_RESPONSE
         )
         # The verdict was scripted as "done" — the real judge_goal must
